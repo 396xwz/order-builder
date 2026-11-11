@@ -1,0 +1,4 @@
+# Compiled binaries (build with: go build ./...)
+/orderservice
+/builder
+*.exe
