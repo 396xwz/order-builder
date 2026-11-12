@@ -68,38 +68,160 @@ func TestIdempotentCreateDifferentBodyRejected(t *testing.T) {
 	// Same key, different contents: should be rejected.
 	in2 := order.Input{Items: []pricing.LineItem{{Size: "Large", Quantity: 1}}}
 	_, created, err = s.Create(in2, "key-123")
-	if err == nil {
-		t.Fatal("expected error for different body with same key")
+	if !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("different body with same key: got %v, want ErrIdempotencyConflict", err)
 	}
 	if created {
 		t.Fatal("created should be false for rejected replay")
 	}
 	if !strings.Contains(err.Error(), o.ID) {
-		t.Errorf("error should mention the original order ID %q, got %v", o.ID, err)
+		t.Errorf("error should mention the original order ID %q so the client is not stranded, got %v", o.ID, err)
 	}
 	if s.Count() != 1 {
 		t.Errorf("store holds %d orders, want 1", s.Count())
 	}
 }
 
-func TestInputsEqual(t *testing.T) {
-	in := smallOrder()
-	o := &order.Order{
-		Items:     []pricing.LineItem{{Size: "Small", Quantity: 1}},
-		PromoCode: "",
+// A replay is judged against the request the key originally created, not
+// against the order's current contents. Otherwise an intervening PATCH
+// would invert the comparison: the true original request would start being
+// rejected, and the post-update contents would start being accepted.
+func TestReplayComparedAgainstOriginalCreationInput(t *testing.T) {
+	s := New()
+	original := smallOrder()
+	o := mustCreate(t, s, original, "key-K")
+
+	// The customer updates the order through the permitted path.
+	updated := order.Input{Items: []pricing.LineItem{{Size: "Large", Quantity: 1}}}
+	if _, err := s.Update(o.ID, updated); err != nil {
+		t.Fatalf("Update: %v", err)
 	}
-	if !inputsEqual(in, o) {
+
+	// Replaying the *original* request must still be recognised as the
+	// same submission and return the same order.
+	replay, created, err := s.Create(original, "key-K")
+	if err != nil {
+		t.Fatalf("replay of the original request: %v", err)
+	}
+	if created {
+		t.Error("replay reported created == true")
+	}
+	if replay.ID != o.ID {
+		t.Errorf("replay returned %s, want original %s", replay.ID, o.ID)
+	}
+	// It returns the order's current state, not the stale contents.
+	if len(replay.Items) != 1 || replay.Items[0].Size != "Large" {
+		t.Errorf("replay should return current state (Large), got %+v", replay.Items)
+	}
+
+	// Submitting the *updated* contents under the same key is a different
+	// creation request and must be refused.
+	if _, _, err := s.Create(updated, "key-K"); !errors.Is(err, ErrIdempotencyConflict) {
+		t.Errorf("post-update contents under the same key: got %v, want ErrIdempotencyConflict", err)
+	}
+	if s.Count() != 1 {
+		t.Errorf("store holds %d orders, want 1", s.Count())
+	}
+}
+
+func TestReplayWorksInTerminalStates(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		prepare func(t *testing.T, s *Store, id string)
+	}{
+		{"cancelled", func(t *testing.T, s *Store, id string) {
+			if _, err := s.Cancel(id); err != nil {
+				t.Fatalf("Cancel: %v", err)
+			}
+		}},
+		{"delivered", func(t *testing.T, s *Store, id string) {
+			for i := 0; i < 3; i++ {
+				if _, err := s.Advance(id); err != nil {
+					t.Fatalf("Advance: %v", err)
+				}
+			}
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s := New()
+			in := smallOrder()
+			o := mustCreate(t, s, in, "key-T")
+			tt.prepare(t, s, o.ID)
+
+			// A late retry must still find the original order rather than
+			// creating a second one behind the customer's back.
+			replay, created, err := s.Create(in, "key-T")
+			if err != nil {
+				t.Fatalf("replay in %s state: %v", tt.name, err)
+			}
+			if created {
+				t.Error("replay reported created == true")
+			}
+			if replay.ID != o.ID {
+				t.Errorf("replay returned %s, want %s", replay.ID, o.ID)
+			}
+			if s.Count() != 1 {
+				t.Errorf("store holds %d orders, want 1", s.Count())
+			}
+		})
+	}
+}
+
+// The recorded creation request must be a private copy: mutating the
+// caller's slices afterwards cannot change what the key means.
+func TestIdempotencyRecordIsIsolatedFromCaller(t *testing.T) {
+	s := New()
+	in := order.Input{Items: []pricing.LineItem{{Size: "Small", Quantity: 1, Toppings: []string{"Bacon"}}}}
+	o := mustCreate(t, s, in, "key-M")
+
+	// Mutate the caller's input after creation.
+	in.Items[0].Toppings[0] = "Pineapple"
+
+	// Replaying the true original request must still match.
+	originalAgain := order.Input{Items: []pricing.LineItem{{Size: "Small", Quantity: 1, Toppings: []string{"Bacon"}}}}
+	replay, created, err := s.Create(originalAgain, "key-M")
+	if err != nil {
+		t.Fatalf("replay after caller mutation: %v", err)
+	}
+	if created || replay.ID != o.ID {
+		t.Errorf("replay returned (%s, created=%v), want (%s, false)", replay.ID, created, o.ID)
+	}
+}
+
+func TestInputsEqual(t *testing.T) {
+	base := smallOrder()
+	if !inputsEqual(base, smallOrder()) {
 		t.Error("identical inputs should be equal")
 	}
-	// Different items.
-	in2 := order.Input{Items: []pricing.LineItem{{Size: "Large", Quantity: 1}}}
-	if inputsEqual(in2, o) {
-		t.Error("different items should not be equal")
+	// A nil and an empty topping list describe the same pizza.
+	nilTops := order.Input{Items: []pricing.LineItem{{Size: "Small", Quantity: 1, Toppings: nil}}}
+	emptyTops := order.Input{Items: []pricing.LineItem{{Size: "Small", Quantity: 1, Toppings: []string{}}}}
+	if !inputsEqual(nilTops, emptyTops) {
+		t.Error("nil and empty topping lists should be equal")
 	}
-	// Different promo.
-	o.PromoCode = "SAVE5"
-	if inputsEqual(in, o) {
-		t.Error("different promo should not be equal")
+	// Promo comparison is case-insensitive via canonical form.
+	lower := order.Input{Items: []pricing.LineItem{{Size: "Large", Quantity: 3}}, PromoCode: "save5"}
+	upper := order.Input{Items: []pricing.LineItem{{Size: "Large", Quantity: 3}}, PromoCode: "SAVE5"}
+	if !inputsEqual(lower, upper) {
+		t.Error("promo codes differing only in case should be equal")
+	}
+
+	for _, tt := range []struct {
+		name string
+		in   order.Input
+	}{
+		{"different size", order.Input{Items: []pricing.LineItem{{Size: "Large", Quantity: 1}}}},
+		{"different quantity", order.Input{Items: []pricing.LineItem{{Size: "Small", Quantity: 2}}}},
+		{"extra item", order.Input{Items: []pricing.LineItem{{Size: "Small", Quantity: 1}, {Size: "Small", Quantity: 1}}}},
+		{"added topping", order.Input{Items: []pricing.LineItem{{Size: "Small", Quantity: 1, Toppings: []string{"Bacon"}}}}},
+		{"added promo", order.Input{Items: []pricing.LineItem{{Size: "Small", Quantity: 1}}, PromoCode: "ILOVEPIZZA"}},
+		{"added tip", order.Input{Items: []pricing.LineItem{{Size: "Small", Quantity: 1}}, Tip: pricing.Tip{Mode: pricing.TipAmount, Amount: 100}}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if inputsEqual(base, tt.in) {
+				t.Errorf("%s should not be equal to the base input", tt.name)
+			}
+		})
 	}
 }
 func TestCreateRejectsInvalidOrder(t *testing.T) {

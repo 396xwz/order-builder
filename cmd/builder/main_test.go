@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -29,6 +30,28 @@ func TestParseMoney(t *testing.T) {
 			}
 		})
 	}
+	// The maximum supported amount parses; one cent more does not. These
+	// guard the conversion from wrapping before the bound is checked.
+	maxDollars := int64(pricing.MaxCents) / 100
+	atMax := fmt.Sprintf("%d.00", maxDollars)
+	if got, err := parseMoney(atMax); err != nil || got != pricing.MaxCents {
+		t.Errorf("parseMoney(%q) = (%d, %v), want (%d, nil)", atMax, got, err, pricing.MaxCents)
+	}
+	for _, input := range []string{
+		fmt.Sprintf("%d.01", maxDollars), // one cent over the maximum
+		fmt.Sprintf("%d", maxDollars+1),  // one dollar over the maximum
+		"184467440737095517",             // reproduced case: wrapped to $0.84
+		"92233720368547758.07",           // near MaxInt64 cents
+		"9223372036854775807",            // MaxInt64 dollars
+		"99999999999999999999999999",     // beyond int64 entirely
+	} {
+		t.Run("overflow/"+input, func(t *testing.T) {
+			if got, err := parseMoney(input); err == nil {
+				t.Errorf("parseMoney(%q) = %d (%s) without an error", input, got, got)
+			}
+		})
+	}
+
 	for _, input := range []string{"", " ", "$", "-1", "$-0.01", "abc", "1.234", "1.", ".50", "1.2.3", "3.x", "1.-1", "1.+1"} {
 		t.Run("invalid/"+input, func(t *testing.T) {
 			if got, err := parseMoney(input); err == nil {
@@ -223,10 +246,10 @@ func TestDispatchControlCommands(t *testing.T) {
 }
 func TestHasPending(t *testing.T) {
 	tests := []struct {
-		name       string
-		idemKey    string
-		orderID    string
-		pendingIn  *order.Input
+		name        string
+		idemKey     string
+		orderID     string
+		pendingIn   *order.Input
 		wantPending bool
 	}{
 		{"no submission", "", "", nil, false},
@@ -271,8 +294,11 @@ func TestEditsBlockedWhilePending(t *testing.T) {
 			if s.dispatch(cmd) {
 				t.Fatal("command requested exit")
 			}
-			if !strings.Contains(out.String(), "previous submission") {
-				t.Errorf("expected 'previous submission' message, got %q", out.String())
+			if !strings.Contains(out.String(), "previous submission's outcome is still unknown") {
+				t.Errorf("expected the unresolved-submission message, got %q", out.String())
+			}
+			if !strings.Contains(out.String(), "submit") {
+				t.Errorf("message should tell the user to retry with submit, got %q", out.String())
 			}
 		})
 	}

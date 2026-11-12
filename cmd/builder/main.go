@@ -73,17 +73,30 @@ type session struct {
 	out          io.Writer
 	items        []pricing.LineItem
 	tip          pricing.Tip
-	promo        string // canonical promo code, "" for none
-	idemKey      string // generated on first submit, reused for every retry of this order
-	orderID      string // set after a successful submit
+	promo        string       // canonical promo code, "" for none
+	idemKey      string       // generated on first submit, reused for every retry of this order
+	orderID      string       // set after a successful submit
 	pendingInput *order.Input // snapshot of the submission when outcome is unresolved
 }
 
 // hasPending reports whether a submission has been attempted but the outcome
-// is still unknown (e.g. a timeout). While pending, edits are blocked so
-// that a retry with the same idempotency key sends the same contents.
+// is still unknown (a timeout, an unreadable reply, or a 5xx that may have
+// followed creation upstream). While pending, edits are blocked so that a
+// retry with the same idempotency key sends exactly the same contents.
 func (s *session) hasPending() bool {
 	return s.idemKey != "" && s.orderID == "" && s.pendingInput != nil
+}
+
+// blockedByPending prints why editing is paused and reports true when the
+// caller should stop. Edits cannot be applied while a submission's outcome
+// is unknown: the saved snapshot must keep matching its idempotency key.
+func (s *session) blockedByPending() bool {
+	if !s.hasPending() {
+		return false
+	}
+	fmt.Fprintln(s.out, "That change was not applied: the previous submission's outcome is still unknown.")
+	fmt.Fprintln(s.out, "Run 'submit' to retry it safely with the same idempotency key. Editing resumes once the outcome is known.")
+	return true
 }
 
 func (s *session) input() order.Input {
@@ -196,8 +209,7 @@ func (s *session) menu() {
 // ---------------------------------------------------------------------------
 
 func (s *session) add(args []string) {
-	if s.hasPending() {
-		fmt.Fprintln(s.out, "The previous submission's outcome is unknown (timed out). Use 'submit' to retry, or 'status <order-id>' if you know the order ID.")
+	if s.blockedByPending() {
 		return
 	}
 	if len(args) < 2 || len(args) > 3 {
@@ -232,8 +244,7 @@ func (s *session) add(args []string) {
 }
 
 func (s *session) remove(args []string) {
-	if s.hasPending() {
-		fmt.Fprintln(s.out, "The previous submission's outcome is unknown (timed out). Use 'submit' to retry, or 'status <order-id>' if you know the order ID.")
+	if s.blockedByPending() {
 		return
 	}
 	idx, ok := s.lineIndex(args)
@@ -246,8 +257,7 @@ func (s *session) remove(args []string) {
 }
 
 func (s *session) setqty(args []string) {
-	if s.hasPending() {
-		fmt.Fprintln(s.out, "The previous submission's outcome is unknown (timed out). Use 'submit' to retry, or 'status <order-id>' if you know the order ID.")
+	if s.blockedByPending() {
 		return
 	}
 	if len(args) != 2 {
@@ -272,8 +282,7 @@ func (s *session) setqty(args []string) {
 }
 
 func (s *session) settoppings(args []string) {
-	if s.hasPending() {
-		fmt.Fprintln(s.out, "The previous submission's outcome is unknown (timed out). Use 'submit' to retry, or 'status <order-id>' if you know the order ID.")
+	if s.blockedByPending() {
 		return
 	}
 	if len(args) != 2 {
@@ -328,8 +337,7 @@ func parseToppings(csv string) ([]string, error) {
 }
 
 func (s *session) setTip(args []string) {
-	if s.hasPending() {
-		fmt.Fprintln(s.out, "The previous submission's outcome is unknown (timed out). Use 'submit' to retry, or 'status <order-id>' if you know the order ID.")
+	if s.blockedByPending() {
 		return
 	}
 	switch {
@@ -357,8 +365,7 @@ func (s *session) setTip(args []string) {
 }
 
 func (s *session) setPromo(args []string) {
-	if s.hasPending() {
-		fmt.Fprintln(s.out, "The previous submission's outcome is unknown (timed out). Use 'submit' to retry, or 'status <order-id>' if you know the order ID.")
+	if s.blockedByPending() {
 		return
 	}
 	if len(args) != 1 {
@@ -465,9 +472,15 @@ func parseMoney(s string) (pricing.Cents, error) {
 			return 0, fmt.Errorf("%q is not a valid amount", s)
 		}
 	}
-	// Check for overflow: MaxCents is the maximum monetary value.
+	// Bound the dollar component *before* multiplying, so the conversion
+	// itself cannot wrap. MaxCents/100 is the largest whole-dollar value
+	// that can still fit once converted.
+	maxDollars := int64(pricing.MaxCents) / 100
+	if dollars > maxDollars {
+		return 0, fmt.Errorf("%q exceeds the maximum amount of %s", s, pricing.MaxCents)
+	}
 	total := dollars*100 + cents
-	if total < 0 || total > int64(pricing.MaxCents) {
+	if total > int64(pricing.MaxCents) {
 		return 0, fmt.Errorf("%q exceeds the maximum amount of %s", s, pricing.MaxCents)
 	}
 	return pricing.Cents(total), nil
@@ -489,6 +502,40 @@ type orderResponse struct {
 	Totals         pricing.Totals `json:"totals"`
 	TotalFormatted string         `json:"total_formatted"`
 	Error          string         `json:"error"`
+}
+
+// validateOrder reports whether a 2xx reply actually describes an order.
+// An empty body, `{}`, or JSON `null` decodes without error but carries no
+// order: announcing success from such a reply would print blank fields and
+// could overwrite a known order ID with "". Callers must treat a failure
+// here as an unresolved outcome, not as a rejection.
+func (r *orderResponse) validateOrder() error {
+	if r == nil {
+		return fmt.Errorf("the service returned no order data")
+	}
+	var missing []string
+	if r.ID == "" {
+		missing = append(missing, "id")
+	}
+	if r.Status == "" {
+		missing = append(missing, "status")
+	}
+	if r.TotalFormatted == "" {
+		missing = append(missing, "total_formatted")
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("the service's reply is missing %s", strings.Join(missing, ", "))
+	}
+	return nil
+}
+
+// errorMessage returns the service's error text, falling back to the HTTP
+// status so a non-JSON or empty error body still says something useful.
+func (r *orderResponse) errorMessage(status int) string {
+	if r != nil && r.Error != "" {
+		return r.Error
+	}
+	return fmt.Sprintf("HTTP %d %s (no error message in the reply)", status, http.StatusText(status))
 }
 
 func (c *apiClient) call(method, path string, in *order.Input, idemKey string) (int, *orderResponse, error) {
@@ -518,9 +565,11 @@ func (c *apiClient) call(method, path string, in *order.Input, idemKey string) (
 	var out orderResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		// Body read or decode failure — e.g. timeout reading the body,
-		// empty body, malformed JSON. Preserve timeout classification so
-		// callers can retry.
-		return resp.StatusCode, nil, fmt.Errorf("reading response body: %w", err)
+		// empty body, malformed JSON. Preserve timeout classification
+		// (via %w) so callers can retry, and keep the HTTP status in the
+		// message: "HTTP 201 but unreadable body" is a very different
+		// situation from "could not reach the service at all".
+		return resp.StatusCode, nil, fmt.Errorf("reading the HTTP %d response body: %w", resp.StatusCode, err)
 	}
 	return resp.StatusCode, &out, nil
 }
@@ -541,16 +590,31 @@ func newIdemKey() string {
 }
 
 // submit sends the order to the service. One idempotency key is generated
-// per local order and reused across retries, so if a submission times out
-// — the request may or may not have arrived — retrying with the same key
-// returns the original order instead of creating a duplicate. The retry
-// happens once, and the customer is told that it happened and why.
+// per local order and reused for every attempt at that order, so a
+// submission whose outcome is uncertain can always be retried without
+// risking a duplicate: the service returns the original order for a key it
+// has already seen.
+//
+// Key/snapshot lifetime is the heart of this function. The key is only
+// cleared when non-creation is actually *established* — a 4xx validation
+// rejection, which the service emits before it stores anything. Every other
+// failure (timeout, body-read error, connection reset, 5xx from an
+// intermediary) is ambiguous: the order may well have been created and the
+// reply lost, so the key and the submitted snapshot are kept and `submit`
+// can be run again safely.
 func (s *session) submit() {
-	// If there's a pending submission, use the saved snapshot so the
-	// idempotency key always maps to the same contents.
+	// If an earlier attempt left an unresolved outcome, resend exactly the
+	// same contents under the same key. Rebuilding the body from the
+	// current (possibly edited) state would make one key mean two
+	// different orders.
 	if s.hasPending() {
-		fmt.Fprintln(s.out, "Reusing the previous submission — the outcome was unknown after a timeout.")
+		fmt.Fprintln(s.out, "Retrying the previous submission — its outcome is still unknown.")
+		fmt.Fprintln(s.out, "The original contents and idempotency key are reused, so this cannot create a duplicate.")
 	} else {
+		if s.orderID != "" {
+			fmt.Fprintf(s.out, "Order %s is already submitted — use 'update' to change it, or 'cancel' to call it off.\n", s.orderID)
+			return
+		}
 		if len(s.items) == 0 {
 			fmt.Fprintln(s.out, "Nothing to submit — the order is empty.")
 			return
@@ -573,31 +637,66 @@ func (s *session) submit() {
 		status, resp, err = s.client.call(http.MethodPost, "/orders", s.pendingInput, s.idemKey)
 	}
 	if err != nil {
-		fmt.Fprintf(s.out, "Could not reach the order service: %v\n", err)
-		if !isTimeout(err) {
-			// Non-timeout error: the request didn't reach the server,
-			// so the idempotency key was never consumed. Reset so the
-			// user can edit and try again fresh.
-			s.idemKey = ""
-			s.pendingInput = nil
-		}
-		// On timeout: keep the pending state so the user can retry.
+		// Transport or body-read failure. We cannot tell whether the
+		// order was created, so the key and snapshot are preserved and
+		// the outcome stays pending.
+		fmt.Fprintf(s.out, "The submission did not complete: %v\n", err)
+		s.reportUnresolved()
 		return
 	}
-	// Submission reached the server.
-	s.pendingInput = nil
-	if status >= 300 {
-		fmt.Fprintf(s.out, "The service rejected the order: %s\n", resp.Error)
-		// A rejection means the order was NOT created, so the key is unused.
+
+	// A 409 means the key is already bound to a different order — proof
+	// that the key *was* used, so it must not be released. The service's
+	// message names the original order ID.
+	if status == http.StatusConflict {
+		fmt.Fprintf(s.out, "The service could not accept this submission: %s\n", resp.errorMessage(status))
+		fmt.Fprintln(s.out, "That idempotency key already belongs to an order, so it has been kept rather than reused for anything else.")
+		fmt.Fprintln(s.out, "Use 'status <order-id>' with the ID above to see that order.")
+		return
+	}
+	// Any other 4xx means the service validated and refused the order
+	// before storing anything; that is the one case where we know no
+	// order exists, so the key can be released and editing resumed.
+	if status >= 400 && status < 500 {
+		fmt.Fprintf(s.out, "The service rejected the order: %s\n", resp.errorMessage(status))
+		fmt.Fprintln(s.out, "No order was created, so you can fix the problem and submit again.")
 		s.idemKey = ""
+		s.pendingInput = nil
 		return
 	}
+	// Any other non-2xx (notably 5xx, possibly from an intermediary) is
+	// ambiguous: upstream may have created the order before the failure.
+	if status >= 300 {
+		fmt.Fprintf(s.out, "The service returned an error: %s\n", resp.errorMessage(status))
+		s.reportUnresolved()
+		return
+	}
+	// 2xx, but the body must actually describe an order before we claim
+	// success or overwrite session state.
+	if err := resp.validateOrder(); err != nil {
+		fmt.Fprintf(s.out, "The service replied HTTP %d but %v.\n", status, err)
+		s.reportUnresolved()
+		return
+	}
+
+	// Resolved: the order exists and we know its ID.
 	s.orderID = resp.ID
+	s.pendingInput = nil
 	if status == http.StatusOK {
-		fmt.Fprintf(s.out, "The service already had this order (idempotent replay) — no duplicate was created.\n")
+		fmt.Fprintln(s.out, "The service already had this order (idempotent replay) — no duplicate was created.")
 	}
 	fmt.Fprintf(s.out, "Order %s submitted. Status: %s. Total charged: %s.\n", resp.ID, resp.Status, resp.TotalFormatted)
 	fmt.Fprintln(s.out, "Changes you make locally from here are NOT sent until you run 'update' (and only while the order is Not Started).")
+}
+
+// reportUnresolved explains an ambiguous submission outcome and the
+// recovery path. The key and snapshot are deliberately left in place: the
+// order may already exist, so retrying under the same key is the only safe
+// action.
+func (s *session) reportUnresolved() {
+	fmt.Fprintln(s.out, "The order may or may not have been created, so nothing has been changed locally.")
+	fmt.Fprintln(s.out, "Run 'submit' again to retry safely with the same idempotency key — if the order already exists you will get that original order back.")
+	fmt.Fprintln(s.out, "Editing is paused until the outcome is known. ('status <order-id>' can look up an order you already know the ID of, but it does not resolve this submission.)")
 }
 
 func (s *session) status(args []string) {
@@ -611,11 +710,15 @@ func (s *session) status(args []string) {
 	}
 	status, resp, err := s.client.call(http.MethodGet, "/orders/"+id, nil, "")
 	if err != nil {
-		fmt.Fprintf(s.out, "Could not reach the order service: %v\n", err)
+		fmt.Fprintf(s.out, "Could not read the order's status: %v\n", err)
 		return
 	}
 	if status >= 300 {
-		fmt.Fprintf(s.out, "The service said: %s\n", resp.Error)
+		fmt.Fprintf(s.out, "The service said: %s\n", resp.errorMessage(status))
+		return
+	}
+	if err := resp.validateOrder(); err != nil {
+		fmt.Fprintf(s.out, "The service replied HTTP %d but %v.\n", status, err)
 		return
 	}
 	fmt.Fprintf(s.out, "Order %s — status: %s — total: %s\n", resp.ID, resp.Status, resp.TotalFormatted)
@@ -633,11 +736,17 @@ func (s *session) update() {
 	in := s.input()
 	status, resp, err := s.client.call(http.MethodPatch, "/orders/"+s.orderID, &in, "")
 	if err != nil {
-		fmt.Fprintf(s.out, "Could not reach the order service: %v\n", err)
+		fmt.Fprintf(s.out, "The update did not complete: %v\n", err)
+		fmt.Fprintf(s.out, "It may or may not have been applied — run 'status' to see the order's current contents before retrying.\n")
 		return
 	}
 	if status >= 300 {
-		fmt.Fprintf(s.out, "The service rejected the update: %s\n", resp.Error)
+		fmt.Fprintf(s.out, "The service rejected the update: %s\n", resp.errorMessage(status))
+		return
+	}
+	if err := resp.validateOrder(); err != nil {
+		fmt.Fprintf(s.out, "The service replied HTTP %d but %v.\n", status, err)
+		fmt.Fprintln(s.out, "Run 'status' to see the order's current contents.")
 		return
 	}
 	fmt.Fprintf(s.out, "Order %s updated. New total: %s.\n", resp.ID, resp.TotalFormatted)
@@ -654,11 +763,17 @@ func (s *session) cancel(args []string) {
 	}
 	status, resp, err := s.client.call(http.MethodPost, "/orders/"+id+"/cancel", nil, "")
 	if err != nil {
-		fmt.Fprintf(s.out, "Could not reach the order service: %v\n", err)
+		fmt.Fprintf(s.out, "The cancellation did not complete: %v\n", err)
+		fmt.Fprintf(s.out, "It may or may not have taken effect — run 'status %s' to check before retrying.\n", id)
 		return
 	}
 	if status >= 300 {
-		fmt.Fprintf(s.out, "The service rejected the cancellation: %s\n", resp.Error)
+		fmt.Fprintf(s.out, "The service rejected the cancellation: %s\n", resp.errorMessage(status))
+		return
+	}
+	if err := resp.validateOrder(); err != nil {
+		fmt.Fprintf(s.out, "The service replied HTTP %d but %v.\n", status, err)
+		fmt.Fprintf(s.out, "Run 'status %s' to confirm whether it was cancelled.\n", id)
 		return
 	}
 	fmt.Fprintf(s.out, "Order %s cancelled.\n", resp.ID)

@@ -190,6 +190,11 @@ func writeStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, err.Error())
 	case errors.Is(err, store.ErrStateConflict):
 		writeError(w, http.StatusConflict, err.Error())
+	case errors.Is(err, store.ErrIdempotencyConflict):
+		// 409, not 400: the request is well-formed, but the key is already
+		// bound to a different order. The message names that order so the
+		// client is never stranded without its ID.
+		writeError(w, http.StatusConflict, err.Error())
 	case errors.Is(err, pricing.ErrPromoNotQualified):
 		writeError(w, http.StatusBadRequest, err.Error())
 	default:

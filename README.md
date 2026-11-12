@@ -118,6 +118,16 @@ tip), `amount_cents` and `percent` must be zero; when mode is
 `"amount"`, `percent` must be zero; when mode is `"percent"`,
 `amount_cents` must be zero.
 
+`POST /orders` accepts an optional `Idempotency-Key` header. The service
+records what each key originally created and compares later requests
+against **that original creation request**, never against the order's
+current contents — so an intervening `PATCH` cannot change what a key
+means. Replaying the original request returns the order's current state
+with its original ID and HTTP 200. Sending *different* contents under a
+used key is HTTP 409, and the error names the original order ID so the
+client is never stranded without it. An absent key opts out of
+idempotency entirely: every such call creates a new order.
+
 ## Assumptions
 
 Every place the requirements left a decision open, the decision made, and
@@ -238,13 +248,28 @@ order may or may not have arrived — the builder retries once with the
 key → order ID on first submission; the retry finds the key and returns
 the original order (HTTP 200 instead of 201) instead of creating a
 duplicate. Guarantee: at most one order created per key within the
-running service. If **both** attempts fail, the outcome is unknown: the
-builder blocks local edits and surfaces the unresolved state so the
-customer can retry. The idempotency key is lost on builder restart, so a
-restart before a successful submission could create a duplicate after an
-undetected first success. Waiting and retrying later is safe for the
-customer: because the key is reused, retries against the running service
-return the original order.
+running service.
+
+*Ambiguous outcomes.* The builder keeps the key and the exact submitted
+contents whenever it cannot prove the order was **not** created — a
+timeout, an unreadable or contentless reply, or a 5xx that may have
+followed creation upstream. In that state it refuses local edits (so the
+key never comes to mean two different orders), explains the situation,
+and `submit` resends the original snapshot under the original key. The
+key is released only on a 4xx validation rejection, which the service
+emits before storing anything; a 409 means the key is already taken, so
+it is kept and the original order ID is reported. A 2xx reply must
+contain `id`, `status`, and `total_formatted` before success is
+announced or the session's order ID is replaced.
+
+The honest limits: the key lives in memory, so restarting the builder
+before an outcome is known loses it, and a later submission could then
+duplicate an order the service had already accepted. Nothing here
+promises eventual delivery across a permanent network failure — only
+that retrying against the running service cannot create a second order.
+`status <order-id>` looks up an order you already know the ID of; it
+deliberately does not adopt that ID as the session's order or resolve a
+pending submission.
 
 *Cancel at the moment the kitchen starts.* Both operations serialize on
 the store mutex, and each validates the status inside the lock. One of
@@ -309,8 +334,15 @@ Packages tested and what they cover:
 - Idempotent create (same key → original order, no duplicate), including
   concurrent idempotency (10 goroutines with one key still produce one
   order and one original ID).
-- Same-key/different-body rejection with the original order ID in the
-  error message.
+- Same-key/different-body rejection (`ErrIdempotencyConflict`) with the
+  original order ID in the error message.
+- Replay is compared against the original creation request: after a
+  `PATCH`, replaying the original request still returns the same order,
+  while the post-update contents under that key are refused.
+- Replay still works once the order is Cancelled or Delivered, so a late
+  retry cannot create a second order.
+- The recorded creation request is a private copy: mutating the caller's
+  slices afterwards does not change what the key means.
 - Create without key always creates a new order.
 - `AdvanceAll` advances each eligible order exactly one step, skips
   terminal states, and returns the right count (including an empty
@@ -328,53 +360,114 @@ Packages tested and what they cover:
 - Unknown top-level fields are rejected with 400.
 - Tip mode/field contradictions are rejected with 400.
 - Rejected requests leave the store unchanged.
+- Same-key/different-body returns 409 naming the original order, while
+  replaying the original request (including after a `PATCH`) returns 200
+  with that order.
 
-### `cmd/builder` — CLI parsing and session logic
+### `cmd/builder` — parsing, session logic, and the HTTP client
+
+Pure parsing and formatting (`main_test.go`):
 
 - `parseMoney` accepts valid dollar amounts and rejects invalid forms
-  (bad signs, too many decimals, garbage).
+  (bad signs, too many decimals, garbage) **and** amounts that would
+  overflow the conversion — including the reproduced
+  `184467440737095517` case, which previously displayed `$0.84`. The
+  supported maximum and just-over-maximum are both covered.
 - `parseToppings` normalizes names, handles separators and whitespace.
 - `Describe` formats orders correctly (toppings, plain, totals).
-- `showTotals` shows subtotal, discount(if any), tax, tip, and total.
+- `showTotals` shows subtotal, discount (if any), tax, tip, and total.
 - Local editing commands (add, remove, setqty, settoppings, tip, promo)
-  update state and show the new totals.
-- Pending-submission state: `hasPending` detects unresolved timeouts;
-  editing commands are blocked while pending.
-- Dispatch routes commands correctly.
+  update state and show the new totals; dispatch routes commands and
+  enforces command arity.
+- Editing is blocked while a submission's outcome is unresolved.
 
-Not covered: the CLI's interactive loop itself (its pricing and API paths
-are covered through the packages it calls; the loop was verified by
-scripted end-to-end sessions against the real service), load/performance,
-and behavior across service restarts (storage is documented as
-in-memory).
+Real HTTP client and submit state machine (`client_test.go`, driven by
+in-process `httptest` servers — no live service and no real timers
+beyond short client timeouts):
+
+- `apiClient.call` reports empty, malformed, and truncated bodies, and
+  non-JSON error pages, as errors rather than success, keeping the HTTP
+  status in the message.
+- A body that stops arriving is classified as a timeout, so submit's
+  retry branch fires.
+- A contentless 2xx (`{}` or `null`) is never announced as success and
+  never overwrites the session's order ID.
+- The idempotency key and submitted snapshot survive every ambiguous
+  outcome (timeout, unreadable 201, 5xx), and the retry reuses both —
+  asserted by inspecting the keys and bodies the server actually
+  received, so a duplicate-creating regression fails the test.
+- A 4xx validation rejection releases the key and re-enables editing; a
+  409 keeps the key and surfaces the original order ID.
+- A timeout triggers exactly one automatic retry with the same key, and
+  leaves the submission pending if that also fails.
+- `submit` on an already-submitted order makes no request and directs
+  the customer to `update`; an empty order makes no request at all.
+- `status` and `cancel` refuse to confirm anything from a contentless
+  reply, and a 502 with an HTML body is not reported as "unreachable".
+
+Not covered: the CLI's interactive read loop itself (`main`'s scanner —
+the commands it dispatches are tested directly), load/performance, and
+behavior across service restarts (storage is documented as in-memory).
+The scripted end-to-end sessions against a real service were a manual
+check during development, not an automated guarantee.
 
 ## AI usage note
 
-An AI coding assistant (Muse) was used to produce the first working
-version of this implementation — structure, pricing/service/builder
-code, and tests — working from the exercise specification. The design
-decisions in the Assumptions section (integer-cents money, a shared
-pricing package as the single source of truth, idempotency keys, the
-locked state machine, the tip-base and order-of-operations choices) were
-specified up front and then checked against the AI's output.
+> _Attribution and the personal-verification example below must be
+> confirmed by the candidate before submission — see the note at the end
+> of this section. Everything else here describes work that is visible in
+> the repository._
 
-- One example of AI output I rejected or had to fix: the initial API
-  client silently discarded JSON decode errors (`json.Decode` error was
+AI coding assistants were used to produce the first working version of
+this implementation — structure, pricing/service/builder code, and tests
+— working from the exercise specification, and then to carry out a
+specification audit and the follow-up fixes. The design decisions in the
+Assumptions section (integer-cents money, a shared pricing package as the
+single source of truth, idempotency keys, the locked state machine, the
+tip-base and order-of-operations choices) were specified up front and
+then checked against the AI's output.
+
+- **One example of AI output that was rejected and fixed.** The initial
+  API client discarded JSON decode errors (the `json.Decode` error was
   assigned to `_`), so an empty or truncated HTTP 201 response was
-  reported as a successful submission. I changed the client to return
-  body-read and decode errors, and added focused tests for empty body,
-  malformed JSON, and body-timeout scenarios. This ensures requirement
-  5's unreliable-network scenario is handled honestly rather than
-  displaying an empty order status.
-- One behavior or invariant I verified myself rather than trusting the
-  AI, and how: I performed a complete specification audit comparing the
-  implementation against all four pages of the exercise PDF, the README,
-  both commands, all internal packages, and their tests. This uncovered
-  three correctness issues (response decoding, unstable submission
-  snapshots, and unchecked integer overflow) that the existing test suite
-  did not catch. I also hand-checked the pizza pricing example from the
-  README and confirmed the numbers matched when the annotation's
-  additional two Small pizzas were included.
+  reported as a successful submission and printed
+  `Order  submitted. Status: . Total charged: .`. Two rounds of fixes
+  were needed, because the first round was incomplete:
+  1. `apiClient.call` now returns body-read and decode errors, wrapping
+     them with `%w` so a body-read timeout is still classified as a
+     timeout and the retry branch fires.
+  2. That alone was not enough: a well-formed but contentless reply
+     (`{}` or `null`) still decoded cleanly and was announced as success.
+     `orderResponse.validateOrder` now requires `id`, `status`, and
+     `total_formatted` before any success message is printed or the
+     session's order ID is replaced.
+
+  A related correction in the same area: the original fix assumed a
+  non-timeout error proved the request never reached the service, and so
+  discarded the idempotency key. That is false — an empty 201 body or a
+  5xx from an intermediary can follow creation upstream — and it caused
+  duplicate orders. The key is now released only for a 4xx validation
+  rejection, which is the one response that proves nothing was stored.
+
+- **One invariant verified rather than trusted, and how.** A
+  specification audit compared the implementation against all four pages
+  of the exercise PDF, the README, both commands, every internal
+  package, and the tests. It reproduced behavior with in-process servers
+  and loopback proxies rather than reading code alone, which is how the
+  false-success decoding, the key-discarding duplicate, the
+  dollar-conversion wrap (`tip amount 184467440737095517` displaying
+  `$0.84`), and the replay-comparison inversion after a `PATCH` were
+  found — none of which the then-current test suite caught. Each
+  finding is now pinned by a regression test in `cmd/builder/client_test.go`,
+  `cmd/builder/main_test.go`, and `internal/store/store_test.go`, so the
+  claims above can be re-checked with `go test -race ./...`.
+
+> **For the candidate to confirm before submission:** name the specific
+> assistants actually used (this repository's history involves more than
+> one), and either endorse the verification account above as your own
+> work or replace it with a check you performed yourself. An AI-produced
+> audit is evidence, but it is not independent human verification, and
+> the PDF asks for the latter.
 
 ## Repository layout
 

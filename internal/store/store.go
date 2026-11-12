@@ -32,19 +32,36 @@ var ErrNotFound = errors.New("order not found")
 // updating or cancelling an order the kitchen has already started.
 var ErrStateConflict = errors.New("operation not allowed in the order's current state")
 
+// ErrIdempotencyConflict is returned (wrapped, with the original order ID)
+// when an idempotency key is reused with contents that differ from the
+// request that key originally created. The key is definitely already used,
+// so the error always names the original order: a client that hits this
+// must be able to find the order it actually has, not be stranded.
+var ErrIdempotencyConflict = errors.New("idempotency key already used for a different order")
+
 // Store holds all orders. The zero value is not usable; call New.
 type Store struct {
 	mu     sync.Mutex
 	orders map[string]*order.Order
-	byIdem map[string]string // idempotency key -> order ID
+	byIdem map[string]idemRecord // idempotency key -> original creation record
 	seq    int
+}
+
+// idemRecord remembers what an idempotency key was first used to create.
+// The creation input is stored separately from the order itself because the
+// order is mutable: a later PATCH changes the order but must not change what
+// the key originally meant. Replay comparison is therefore always against
+// the immutable original request, not the order's current contents.
+type idemRecord struct {
+	orderID string
+	input   order.Input
 }
 
 // New returns an empty store.
 func New() *Store {
 	return &Store{
 		orders: map[string]*order.Order{},
-		byIdem: map[string]string{},
+		byIdem: map[string]idemRecord{},
 	}
 }
 
@@ -59,20 +76,30 @@ func (s *Store) Count() int {
 // pricing package (client-supplied totals are never accepted — Input has
 // no totals field). The order starts life as Not Started.
 //
-// If idemKey is non-empty and was seen before, Create returns the original
-// order with created == false and stores nothing new: a customer retrying
-// a submission after a timeout gets their original order ID back, never a
-// duplicate. An empty key opts out of idempotency (every call creates a
-// new order), which the API documents.
+// If idemKey is non-empty and was seen before, Create returns the order
+// that key created, with created == false, and stores nothing new: a
+// customer retrying a submission after a timeout gets their original order
+// ID back, never a duplicate. An empty key opts out of idempotency (every
+// call creates a new order), which the API documents.
+//
+// Replay is compared against the *original creation request* recorded for
+// that key, never against the order's current contents, so an intervening
+// PATCH cannot change what a replay of the original request means. A replay
+// returns the order's current state under its original ID; it does not
+// resurrect the old contents.
 func (s *Store) Create(in order.Input, idemKey string) (o *order.Order, created bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if idemKey != "" {
-		if id, ok := s.byIdem[idemKey]; ok {
-			existing := s.orders[id]
-			if !inputsEqual(in, existing) {
-				return nil, false, fmt.Errorf("idempotency key %q already used for order %q with different contents; use PATCH /orders/%s to update", idemKey, id, id)
+		if rec, ok := s.byIdem[idemKey]; ok {
+			if !inputsEqual(in, rec.input) {
+				return nil, false, fmt.Errorf("%w: key %q created order %s; retry that exact request or use PATCH /orders/%s to change it",
+					ErrIdempotencyConflict, idemKey, rec.orderID, rec.orderID)
+			}
+			existing, ok := s.orders[rec.orderID]
+			if !ok {
+				return nil, false, fmt.Errorf("%w: key %q refers to missing order %s", ErrNotFound, idemKey, rec.orderID)
 			}
 			return existing.Clone(), false, nil
 		}
@@ -95,7 +122,16 @@ func (s *Store) Create(in order.Input, idemKey string) (o *order.Order, created 
 	}
 	s.orders[o.ID] = o
 	if idemKey != "" {
-		s.byIdem[idemKey] = o.ID
+		// Record a private deep copy of the creation request so later
+		// mutation of the caller's slices cannot alter what this key means.
+		s.byIdem[idemKey] = idemRecord{
+			orderID: o.ID,
+			input: order.Input{
+				Items:     cloneItems(in.Items),
+				Tip:       in.Tip,
+				PromoCode: in.PromoCode,
+			},
+		}
 	}
 	return o.Clone(), true, nil
 }
@@ -218,17 +254,28 @@ func cloneItems(items []pricing.LineItem) []pricing.LineItem {
 	return out
 }
 
-// inputsEqual reports whether the given input matches the order's current
-// items, tip, and promo code. Used to detect same-key/different-body misuse.
-func inputsEqual(in order.Input, o *order.Order) bool {
-	if !reflect.DeepEqual(in.Items, o.Items) {
+// inputsEqual reports whether two creation requests are the same order.
+// Promo codes are compared in canonical form so "save5" and "SAVE5" are one
+// request; items are compared element-wise, treating a nil and an empty
+// topping list as equivalent.
+func inputsEqual(a, b order.Input) bool {
+	if len(a.Items) != len(b.Items) {
 		return false
 	}
-	if in.Tip != o.Tip {
+	for i := range a.Items {
+		x, y := a.Items[i], b.Items[i]
+		if x.Size != y.Size || x.Quantity != y.Quantity {
+			return false
+		}
+		if len(x.Toppings) != len(y.Toppings) {
+			return false
+		}
+		if len(x.Toppings) > 0 && !reflect.DeepEqual(x.Toppings, y.Toppings) {
+			return false
+		}
+	}
+	if a.Tip != b.Tip {
 		return false
 	}
-	if canonicalPromo(in.PromoCode) != o.PromoCode {
-		return false
-	}
-	return true
+	return canonicalPromo(a.PromoCode) == canonicalPromo(b.PromoCode)
 }
