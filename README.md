@@ -111,12 +111,27 @@ Trying to cancel after the kitchen has started the order (409):
 
 The request body for `POST /orders` and `PATCH /orders/{id}` is the
 order's contents only — items, tip, promo code. There is deliberately no
-totals field: the service computes totals itself and rejects unknown
-top-level fields as well as trailing content after the JSON value. The
-`Tip` object requires a consistent `mode` field: when mode is `""` (no
-tip), `amount_cents` and `percent` must be zero; when mode is
-`"amount"`, `percent` must be zero; when mode is `"percent"`,
-`amount_cents` must be zero.
+totals field: the service computes totals itself.
+
+Both endpoints enforce the same strict request contract, and a refused
+request never changes stored state:
+
+- **Exactly one JSON object.** Trailing content or a second object is
+  rejected; the body-size limit (1 MiB) is enforced while consuming the
+  request, not inferred from one successful parse.
+- **No unknown fields at any level.** `{"totals":…}` is rejected rather
+  than ignored, and so is a misspelled nested property such as
+  `{"tip":{"amount_cent":300}}`, which would otherwise be read silently
+  as "no tip".
+- **Integer tokens stay integers.** The body is decoded directly into the
+  typed request struct, so `{"quantity":1.00000000000000001}` and
+  `{"amount_cents":100.000000000000001}` are rejected instead of being
+  rounded into valid-looking values. Money and quantities are integers
+  end to end, including at the decoding boundary.
+- **The `Tip` object must be internally consistent.** When mode is `""`
+  (no tip), `amount_cents` and `percent` must be zero; when mode is
+  `"amount"`, `percent` must be zero; when mode is `"percent"`,
+  `amount_cents` must be zero.
 
 `POST /orders` accepts an optional `Idempotency-Key` header. The service
 records what each key originally created and compares later requests
@@ -356,9 +371,17 @@ Packages tested and what they cover:
 - Idempotent replay over HTTP returns 200 instead of 201.
 - Lifecycle conflicts return 409 with a readable message.
 - Bad promos and unqualified promos return 400.
-- Trailing content after JSON is rejected with 400.
-- Unknown top-level fields are rejected with 400.
+- Trailing content and a second JSON object are rejected with 400.
+- Unknown fields are rejected with 400 at the top level *and* nested
+  (`{"tip":{"amount_cent":300}}`, unknown item fields).
+- Non-integer numeric tokens are rejected rather than rounded —
+  `quantity:1.00000000000000001`, `amount_cents:100.000000000000001`,
+  `1.5`, `1e2`, and a quoted `"1"`.
 - Tip mode/field contradictions are rejected with 400.
+- `PATCH` enforces the identical contract, and a refused `PATCH` leaves
+  the order byte-for-byte unchanged (verified by re-reading it).
+- Body-size limits: a large but legal body is accepted; an oversized one
+  is refused and leaves the store unchanged.
 - Rejected requests leave the store unchanged.
 - Same-key/different-body returns 409 naming the original order, while
   replaying the original request (including after a `PATCH`) returns 200
@@ -380,6 +403,13 @@ Pure parsing and formatting (`main_test.go`):
   update state and show the new totals; dispatch routes commands and
   enforces command arity.
 - Editing is blocked while a submission's outcome is unresolved.
+- Invalid arity on a network command (`submit unexpected`,
+  `cancel nonexistent-id unexpected`, `status a b`, `update x`) reports
+  usage and issues **no request** — asserted against the server — so
+  excess arguments can never cancel the session's own order.
+- `cancel`/`status` use the session's order by default and an explicit
+  ID when given; an explicit ID does not become the session's order, and
+  with no ID and nothing submitted they make no request.
 
 Real HTTP client and submit state machine (`client_test.go`, driven by
 in-process `httptest` servers — no live service and no real timers

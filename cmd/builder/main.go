@@ -126,12 +126,22 @@ func (s *session) dispatch(line string) bool {
 	case "settoppings":
 		s.settoppings(args)
 	case "describe":
+		if len(args) > 0 {
+			fmt.Fprintln(s.out, "Usage: describe (no arguments)")
+			break
+		}
 		s.describe()
 	case "tip":
 		s.setTip(args)
 	case "promo":
 		s.setPromo(args)
 	case "submit":
+		// Arity is checked before anything is sent: `submit unexpected`
+		// must not create an order.
+		if len(args) > 0 {
+			fmt.Fprintln(s.out, "Usage: submit (no arguments). Nothing was sent.")
+			break
+		}
 		s.submit()
 	case "status":
 		if len(args) > 1 {

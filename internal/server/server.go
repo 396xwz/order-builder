@@ -12,6 +12,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 
 	"pizzabuilder/internal/order"
 	"pizzabuilder/internal/pricing"
@@ -111,45 +112,43 @@ func (h *handler) advanceOrder(w http.ResponseWriter, r *http.Request) {
 // validation (sizes, toppings, promos, totals) happens in the store via
 // the pricing package.
 //
-// The server enforces a strict JSON shape: no unknown top-level fields,
-// no trailing content after the JSON value, and a 1 MiB body limit.
+// The server enforces a strict JSON shape: exactly one complete JSON
+// object, no unknown fields at any level, no trailing content after the
+// value, and a 1 MiB body limit.
+//
+// The decode is deliberately *direct into the typed struct*. Routing the
+// body through `map[string]any` first would turn every number into a
+// float64, and re-marshalling that float can silently repair an invalid
+// value: `"quantity":1.00000000000000001` would arrive as quantity 1 and
+// `"amount_cents":100.000000000000001` as 100 cents. Decoding straight
+// into `order.Input` makes the standard library reject a non-integer
+// token for an integer field, so the integer-money guarantee covers
+// request decoding and not only pricing.
 func decodeInput(w http.ResponseWriter, r *http.Request) (order.Input, bool) {
 	br := http.MaxBytesReader(w, r.Body, 1<<20)
 	dec := json.NewDecoder(br)
+	// Reject unknown fields at every level, which also catches misspelled
+	// nested properties such as {"tip":{"amount_cent":300}} that would
+	// otherwise be silently read as "no tip".
+	dec.DisallowUnknownFields()
 
-	// First decode into a generic map to check for unknown top-level fields.
-	var raw map[string]any
-	if err := dec.Decode(&raw); err != nil {
+	var in order.Input
+	if err := dec.Decode(&in); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return order.Input{}, false
 	}
-	knownFields := map[string]bool{"items": true, "tip": true, "promo_code": true}
-	for key := range raw {
-		if !knownFields[key] {
-			writeError(w, http.StatusBadRequest, "unknown field "+key)
+
+	// Require that the body held exactly one JSON value. A second Decode
+	// must report EOF; anything else means trailing content. This also
+	// keeps consuming through MaxBytesReader, so an oversized body is
+	// still caught rather than being accepted because its first value
+	// happened to parse.
+	var trailing json.RawMessage
+	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err != nil && strings.Contains(err.Error(), "request body too large") {
+			writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
 			return order.Input{}, false
 		}
-	}
-
-	// Re-marshal into the typed struct to reject mismatched types.
-	b, err := json.Marshal(raw)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
-		return order.Input{}, false
-	}
-	var in order.Input
-	if err := json.Unmarshal(b, &in); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
-		return order.Input{}, false
-	}
-
-	// Check for trailing content after the JSON value.
-	var trailing any
-	if err := dec.Decode(&trailing); err == nil {
-		writeError(w, http.StatusBadRequest, "unexpected content after request body")
-		return order.Input{}, false
-	} else if !errors.Is(err, io.EOF) {
-		// Non-EOF error means non-whitespace trailing bytes.
 		writeError(w, http.StatusBadRequest, "unexpected content after request body")
 		return order.Input{}, false
 	}

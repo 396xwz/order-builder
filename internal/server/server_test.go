@@ -288,6 +288,145 @@ func TestUnknownFieldsRejected(t *testing.T) {
 	}
 }
 
+// patchRaw sends a raw JSON body to PATCH and returns status and text.
+func patchRaw(t *testing.T, url, body string) (int, string) {
+	t.Helper()
+	req, _ := http.NewRequest(http.MethodPatch, url, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("PATCH %s: %v", url, err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(b)
+}
+
+// Money and quantities are integers end to end. A non-integer token must
+// be rejected outright, never silently rounded into a valid-looking value
+// by passing through a float64 intermediate.
+func TestNonIntegerNumbersRejected(t *testing.T) {
+	bodies := map[string]string{
+		"fractional quantity":         `{"items":[{"size":"Small","quantity":1.00000000000000001}]}`,
+		"fractional amount_cents":     `{"items":[{"size":"Small","quantity":1}],"tip":{"mode":"amount","amount_cents":100.000000000000001}}`,
+		"plainly fractional quantity": `{"items":[{"size":"Small","quantity":1.5}]}`,
+		"fractional percent":          `{"items":[{"size":"Small","quantity":1}],"tip":{"mode":"percent","percent":10.5}}`,
+		"exponent quantity":           `{"items":[{"size":"Small","quantity":1e2}]}`,
+		"string quantity":             `{"items":[{"size":"Small","quantity":"1"}]}`,
+	}
+	for name, body := range bodies {
+		t.Run(name, func(t *testing.T) {
+			srv, st := testServer(t)
+			status, resp := postRaw(t, srv.URL+"/orders", body)
+			if status != http.StatusBadRequest {
+				t.Errorf("POST status = %d, want 400. body: %s", status, resp)
+			}
+			if st.Count() != 0 {
+				t.Errorf("store holds %d orders after a rejected request, want 0", st.Count())
+			}
+		})
+	}
+}
+
+// A misspelled nested property must not be silently read as "absent".
+func TestNestedUnknownFieldsRejected(t *testing.T) {
+	bodies := map[string]string{
+		"misspelled tip amount": `{"items":[{"size":"Small","quantity":1}],"tip":{"amount_cent":300}}`,
+		"unknown item field":    `{"items":[{"size":"Small","quantity":1,"extra_cheese":true}]}`,
+		"unknown tip field":     `{"items":[{"size":"Small","quantity":1}],"tip":{"mode":"amount","amount_cents":300,"currency":"USD"}}`,
+	}
+	for name, body := range bodies {
+		t.Run(name, func(t *testing.T) {
+			srv, st := testServer(t)
+			status, resp := postRaw(t, srv.URL+"/orders", body)
+			if status != http.StatusBadRequest {
+				t.Errorf("POST status = %d, want 400. body: %s", status, resp)
+			}
+			if !strings.Contains(resp, "unknown field") {
+				t.Errorf("body should name the unknown field, got: %s", resp)
+			}
+			if st.Count() != 0 {
+				t.Errorf("store holds %d orders, want 0", st.Count())
+			}
+		})
+	}
+}
+
+// PATCH shares the same decoder, so it must enforce the same contract and
+// leave the existing order untouched when a request is refused.
+func TestPatchEnforcesShapeAndLeavesOrderUnchanged(t *testing.T) {
+	srv, _ := testServer(t)
+	_, v := post(t, srv.URL+"/orders", "", sampleInput())
+	before, _ := json.Marshal(v)
+
+	for name, body := range map[string]string{
+		"unknown top-level field": `{"items":[{"size":"Large","quantity":1}],"totals":{"total_cents":1}}`,
+		"nested unknown field":    `{"items":[{"size":"Large","quantity":1}],"tip":{"amount_cent":300}}`,
+		"trailing content":        `{"items":[{"size":"Large","quantity":1}]} garbage`,
+		"two JSON objects":        `{"items":[{"size":"Large","quantity":1}]}{"a":1}`,
+		"fractional quantity":     `{"items":[{"size":"Large","quantity":1.00000000000000001}]}`,
+		"contradictory tip":       `{"items":[{"size":"Large","quantity":1}],"tip":{"mode":"amount","amount_cents":300,"percent":10}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			status, resp := patchRaw(t, srv.URL+"/orders/"+v.ID, body)
+			if status != http.StatusBadRequest {
+				t.Errorf("PATCH status = %d, want 400. body: %s", status, resp)
+			}
+			// The order must be byte-for-byte what it was.
+			getResp, err := http.Get(srv.URL + "/orders/" + v.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got orderView
+			_ = json.NewDecoder(getResp.Body).Decode(&got)
+			getResp.Body.Close()
+			after, _ := json.Marshal(got)
+			if string(after) != string(before) {
+				t.Errorf("order changed after a rejected PATCH:\nbefore %s\nafter  %s", before, after)
+			}
+		})
+	}
+
+	// A well-formed PATCH still works afterwards.
+	status, resp := patchRaw(t, srv.URL+"/orders/"+v.ID, `{"items":[{"size":"Large","quantity":1}]}`)
+	if status != http.StatusOK {
+		t.Errorf("valid PATCH status = %d, want 200. body: %s", status, resp)
+	}
+}
+
+// The 1 MiB limit must be enforced while consuming the body, not assumed
+// from one successful decode.
+func TestBodySizeLimit(t *testing.T) {
+	srv, st := testServer(t)
+
+	// A large but legal body is accepted.
+	okItem := `{"size":"Small","quantity":1}`
+	var b strings.Builder
+	b.WriteString(`{"items":[`)
+	for i := 0; i < 500; i++ {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		b.WriteString(okItem)
+	}
+	b.WriteString(`]}`)
+	if status, resp := postRaw(t, srv.URL+"/orders", b.String()); status != http.StatusCreated {
+		t.Errorf("large legal body status = %d, want 201. body: %s", status, resp)
+	}
+
+	// An oversized body is refused rather than accepted because its
+	// leading bytes happened to parse.
+	before := st.Count()
+	huge := `{"items":[{"size":"Small","quantity":1}],"promo_code":"` + strings.Repeat("A", 2<<20) + `"}`
+	status, resp := postRaw(t, srv.URL+"/orders", huge)
+	if status != http.StatusRequestEntityTooLarge && status != http.StatusBadRequest {
+		t.Errorf("oversized body status = %d, want 413 or 400. body: %s", status, resp)
+	}
+	if st.Count() != before {
+		t.Errorf("oversized body changed the store: %d -> %d", before, st.Count())
+	}
+}
+
 func TestTipModeValidation(t *testing.T) {
 	srv, st := testServer(t)
 	before := st.Count()

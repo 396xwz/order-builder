@@ -483,6 +483,112 @@ func TestSubmitEmptyOrderMakesNoRequest(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Command arity: invalid arguments must not reach the network
+// ---------------------------------------------------------------------------
+
+// Excess arguments must be reported as a usage error and issue no request,
+// so `cancel nonexistent-id unexpected` can never cancel the session's own
+// order by falling through to s.orderID.
+func TestInvalidArityMakesNoRequest(t *testing.T) {
+	for _, cmd := range []string{
+		"submit unexpected",
+		"update unexpected",
+		"status id-one id-two",
+		"cancel nonexistent-id unexpected",
+		"describe unexpected",
+	} {
+		t.Run(cmd, func(t *testing.T) {
+			h := &recordingHandler{respond: func(w http.ResponseWriter, r *http.Request, attempt int) {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"id":"ord-0001","status":"Cancelled","total_formatted":"$5.33"}`))
+			}}
+			s, out := newTestSession(t, h)
+			s.orderID = "ord-0001"
+
+			s.dispatch(cmd)
+
+			if keys, _ := h.recorded(); len(keys) != 0 {
+				t.Errorf("%q issued %d request(s); it must make none", cmd, len(keys))
+			}
+			if !strings.Contains(out.String(), "Usage:") {
+				t.Errorf("%q should report usage, got %q", cmd, out.String())
+			}
+			// Session state must be untouched.
+			if s.orderID != "ord-0001" {
+				t.Errorf("orderID changed to %q", s.orderID)
+			}
+		})
+	}
+}
+
+// The normal forms still work: the default ID and an explicit ID both
+// reach the service, and an explicit ID does not become the session's
+// order.
+func TestCancelDefaultAndExplicitID(t *testing.T) {
+	t.Run("default id", func(t *testing.T) {
+		var paths []string
+		h := &recordingHandler{respond: func(w http.ResponseWriter, r *http.Request, attempt int) {
+			paths = append(paths, r.URL.Path)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"id":"ord-0001","status":"Cancelled","total_formatted":"$5.33"}`))
+		}}
+		s, out := newTestSession(t, h)
+		s.orderID = "ord-0001"
+
+		s.dispatch("cancel")
+
+		if len(paths) != 1 || paths[0] != "/orders/ord-0001/cancel" {
+			t.Errorf("requested paths = %v, want one /orders/ord-0001/cancel", paths)
+		}
+		if !strings.Contains(out.String(), "Order ord-0001 cancelled.") {
+			t.Errorf("output = %q", out.String())
+		}
+	})
+
+	t.Run("explicit id", func(t *testing.T) {
+		var paths []string
+		h := &recordingHandler{respond: func(w http.ResponseWriter, r *http.Request, attempt int) {
+			paths = append(paths, r.URL.Path)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"id":"ord-0042","status":"Cancelled","total_formatted":"$5.33"}`))
+		}}
+		s, _ := newTestSession(t, h)
+		s.orderID = "ord-0001"
+
+		s.dispatch("cancel ord-0042")
+
+		if len(paths) != 1 || paths[0] != "/orders/ord-0042/cancel" {
+			t.Errorf("requested paths = %v, want one /orders/ord-0042/cancel", paths)
+		}
+		// Cancelling someone else's ID must not retarget the session.
+		if s.orderID != "ord-0001" {
+			t.Errorf("session orderID changed to %q", s.orderID)
+		}
+	})
+}
+
+// With no submitted order and no argument, cancel/status must not guess.
+func TestCancelAndStatusWithoutIDMakeNoRequest(t *testing.T) {
+	for _, cmd := range []string{"cancel", "status"} {
+		t.Run(cmd, func(t *testing.T) {
+			h := &recordingHandler{respond: func(w http.ResponseWriter, r *http.Request, attempt int) {
+				w.WriteHeader(http.StatusOK)
+			}}
+			s, out := newTestSession(t, h)
+
+			s.dispatch(cmd)
+
+			if keys, _ := h.recorded(); len(keys) != 0 {
+				t.Errorf("%q issued %d request(s) with no known order", cmd, len(keys))
+			}
+			if !strings.Contains(out.String(), "No order submitted yet") {
+				t.Errorf("output = %q", out.String())
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
 // status / cancel: no false confirmations
 // ---------------------------------------------------------------------------
 
