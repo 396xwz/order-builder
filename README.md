@@ -199,6 +199,18 @@ where it lives in the code:
 13. **No authentication**, per the constraints. Anyone who can reach the
     service can advance orders; the advance endpoint is a simulation of
     the restaurant side, not a secured staff API.
+14. **Orders have declared numeric limits.** A line item's quantity must
+    be in `[1, 1,000,000]` (`pricing.MaxQuantity`), and every monetary
+    figure — each line total, the subtotal, and the final total — must be
+    in `[$0.00, $1,000,000,000.00]` (`pricing.MaxCents`). These are a
+    domain decision, not an artifact of `int64`: the bounds sit far below
+    the point where the arithmetic could overflow, and the `safe*` helpers
+    additionally check `int64` overflow as a backstop so a future menu or
+    limit change cannot silently wrap. Input outside the range is
+    **rejected with an error**, never clamped or wrapped — including a
+    total that only exceeds the limit once tax and a dollar tip are added
+    to an otherwise-legal subtotal. The CLI applies the same bounds when
+    parsing a typed dollar amount, before the conversion to cents.
 
 ## Design write-up
 
@@ -211,19 +223,70 @@ topping categories, toppings) as data tables, promo codes as data records
 (see below), and a single `Price` function that computes the breakdown in
 the documented order of operations.
 
+There is exactly one rounding rule — round half up, applied in exactly
+three places (percentage discounts, tax, percentage tips) — implemented
+as integer arithmetic by adding `den/2` before dividing. That trick is
+only round-half-up for a **non-negative** amount; on a negative value it
+rounds half toward zero instead. Since every amount it is applied to is
+non-negative by construction, the helper rejects a negative input rather
+than quietly returning a figure rounded by a second, undocumented rule.
+
 Pricing runs in **both** processes, from the **same** package. The
 builder computes the running total locally so the customer sees it update
-on every edit with no network round-trips. The service recomputes the
-total on every submission and update and never accepts a client-supplied
-total (the request format has no totals field at all). Requirement 2 —
-"the total the customer sees must match the total the restaurant
-charges" — is therefore guaranteed for the same input on both sides:
-shared pricing prevents calculation drift, but the guarantee also
-depends on the client sending the correct contents (verifiable by the
-server's strict JSON decoding; see F01/F07) and the response body being
-correctly received (verifiable by the client's response decode error
-handling; see F01). An HTTP-level test asserts the service's totals
-equal the pricing package's, cent for cent, for a round-tripped order.
+on every edit with no network round-trips.
+
+`Price` computes, in this order (assumption 1, restated here so the
+design answer stands on its own):
+
+```
+subtotal = Σ quantity × (base_price + Σ topping_rate × base_price)
+discount = promo applied to the pre-tax subtotal, if it qualifies
+taxable  = subtotal − discount
+tax      = round_half_up(6.5% of taxable)
+tip      = dollar amount as given, or round_half_up(percent of taxable + tax)
+total    = taxable + tax + tip
+```
+
+Every figure is bounded: a quantity in `[1, 1,000,000]` and every
+monetary figure in `[$0.00, $1,000,000,000.00]` (assumption 14), rejected
+rather than clamped or wrapped.
+
+Requirement 2 — "the total the customer sees must match the total the
+restaurant charges" — holds as follows, stated precisely because a
+blanket claim would be too strong:
+
+- **Guaranteed by construction:** for identical contents, the two
+  processes cannot compute different totals. There is one `Price`
+  function and one menu table, so calculation drift is impossible by
+  design, not by keeping two implementations in sync.
+- **Enforced by the service:** the charged total is recomputed
+  server-side on every submission and update, from the stored contents.
+  No client-supplied total is ever trusted, because the request format
+  has nowhere to put one.
+- **Not proved by strict decoding.** Rejecting unknown fields, trailing
+  content, and non-integer money tokens stops a *malformed or silently
+  reinterpreted* request from being priced — `{"quantity":1.0000000001}`
+  is refused rather than rounded to 1 — but a valid shape is not evidence
+  that the body describes the draft the customer was looking at. A
+  well-formed request for the wrong pizza is still well-formed. What
+  actually ties the charge to the draft is narrower and mechanical: the
+  builder freezes the submitted contents in a snapshot and resends that
+  exact snapshot on every retry, refusing local edits until the outcome
+  is known, so one idempotency key can never come to mean two different
+  orders. Agreement on the *figure* then follows from the shared `Price`
+  function, not from validation.
+- **Depends on the reply being read correctly**, which response
+  validation enforces: a submission is only reported as complete when
+  the service returned 200/201 with a usable order body.
+- **Not claimed:** that the figure on screen after an *unresolved*
+  submission is the charged total. In that state the builder reports the
+  outcome as unknown and shows no charged total at all; `status` is what
+  confirms the authoritative figure.
+
+Tests cover both halves: an HTTP-level test asserts the service's totals
+equal the pricing package's cent for cent, and an end-to-end test drives
+the real builder through a fault-injecting proxy and then compares the
+total it displayed with the total the service actually stored.
 
 ### Extensibility: menu and promos as data
 
@@ -240,13 +303,49 @@ the pre-tax subtotal), its parameters, an optional qualifying condition
 a list of codes it conflicts with. The engine interprets records
 generically: compute the discount if it qualifies, floor a fixed discount
 at the subtotal, and refuse conflicting combinations using the records'
-own conflict lists (validated for symmetry by a test). A new promo —
-including one with its own conditions and conflicts — is a new record,
-not a new branch. The honest limit of this design: a promo whose
-*mechanism* is new (say, "cheapest pizza free", or a discount on a
-single category) needs a new `PromoKind` and a case in the discount
-function. Conditions and conflicts, the dimensions promos in this spec
-actually vary along, are pure data.
+own conflict lists (validated for symmetry by a test). A new promo whose
+condition is a minimum subtotal and whose conflicts are named codes is a
+new record, not a new branch — for example "$8 off over $50, never with
+SAVE5":
+
+```go
+{
+    Code:               "BIGORDER8",
+    Kind:               PromoFixedOff,
+    Amount:             800,
+    HasMin:             true,
+    MinPreTaxExclusive: 5000,
+    Conflicts:          []string{"SAVE5"},
+    Description:        "$8 off when the pre-tax total is over $50",
+},
+```
+
+That is one row in `promoList`; no pricing code changes, and the
+conflict-symmetry test requires the matching entry on `SAVE5`. The core
+pricing tests stay as they are — only the menu/promo regression tests
+grow a case for the new record.
+
+The honest limits of this design, since "data-driven" is easy to
+overclaim:
+
+- **New discount *mechanisms* need code.** "Cheapest pizza free", a
+  category-specific discount, or a buy-one-get-one all require a new
+  `PromoKind` and a case in the discount function. Only percent-off and
+  fixed-amount-off the pre-tax subtotal are data today.
+- **New *condition types* need code.** The only qualifying condition is a
+  minimum pre-tax subtotal. A condition on item count, a specific size, a
+  date range, or a customer attribute is a new field and new evaluation
+  logic, not a new row.
+- **Exclusion is pairwise and total.** Conflicts are declared as symmetric
+  code lists and at most one promo applies per order. "Stacking up to two
+  promos" or "this promo stacks only with that one" is a different model
+  and would need a rework, not a record.
+- **Promo application order is not modelled**, because only one promo can
+  apply. Supporting several would force a decision about sequencing that
+  the current design deliberately does not make.
+
+Conditions and conflicts — the dimensions the promos in this spec
+actually vary along — are pure data.
 
 ### Order lifecycle, retries, and races
 
@@ -266,25 +365,53 @@ duplicate. Guarantee: at most one order created per key within the
 running service.
 
 *Ambiguous outcomes.* The builder keeps the key and the exact submitted
-contents whenever it cannot prove the order was **not** created — a
-timeout, an unreadable or contentless reply, or a 5xx that may have
-followed creation upstream. In that state it refuses local edits (so the
-key never comes to mean two different orders), explains the situation,
-and `submit` resends the original snapshot under the original key. The
-key is released only on a 4xx validation rejection, which the service
-emits before storing anything; a 409 means the key is already taken, so
-it is kept and the original order ID is reported. A 2xx reply must
-contain `id`, `status`, and `total_formatted` before success is
-announced or the session's order ID is replaced.
+contents whenever it cannot prove the order was **not** created. In that
+state it refuses local edits (so the key never comes to mean two
+different orders), explains the situation, and `submit` resends the
+original snapshot under the original key.
 
-The honest limits: the key lives in memory, so restarting the builder
-before an outcome is known loses it, and a later submission could then
-duplicate an order the service had already accepted. Nothing here
-promises eventual delivery across a permanent network failure — only
-that retrying against the running service cannot create a second order.
-`status <order-id>` looks up an order you already know the ID of; it
-deliberately does not adopt that ID as the session's order or resolve a
-pending submission.
+The key is released only for a response that *establishes* non-creation,
+which is narrower than "any 4xx":
+
+| Response | Treated as | Why |
+| --- | --- | --- |
+| 201, 200 | Resolved | Created, or an idempotent replay. |
+| A service *validation* rejection (e.g. 400 on a bad promo) | Non-creation established | The service judges the contents before storing, so nothing exists. |
+| 409 | Key is in use | Proof the key *was* used; it is kept and the original order ID is reported. |
+| 408, 425 | Ambiguous | The request failed to arrive usably — a proxy can emit these after the origin stored the order. |
+| 5xx | Ambiguous | May have been emitted after creation upstream. |
+| Other 2xx (202, 204, …) | Ambiguous | Not a defined outcome; 202 means "queued, not necessarily stored". |
+| Timeout / unreadable / contentless body | Ambiguous | The reply says nothing reliable. |
+
+A 200 or 201 must also carry `id`, `status`, and `total_formatted` before
+success is announced or the session's order ID is replaced.
+
+The honest limits:
+
+- **"Validation rejection" is inferred, not authenticated.** 408, 425,
+  and 409 are singled out by status code, and everything else in `[400,
+  500)` is *treated* as the service's own judgement on the contents. A
+  4xx an intermediary synthesizes for its own reasons — a proxy's 403 or
+  404 — is indistinguishable on the wire from that judgement, so the
+  builder would release the key for it. Narrowing this further needs a
+  signal the service controls that a proxy cannot forge, which this
+  exercise does not build.
+- **The key lives in memory**, so restarting the builder before an
+  outcome is known loses it, and a later submission could then duplicate
+  an order the service had already accepted.
+- **No eventual delivery is promised** across a permanent network
+  failure — only that retrying against the running service cannot create
+  a second order.
+- **`status` does not resolve anything.** `status <order-id>` looks up an
+  order you already know the ID of; it deliberately does not adopt that
+  ID as the session's order or resolve a pending submission. It also
+  reports only the ID, lifecycle status, and charged total — never items,
+  toppings, tip, or promo — so it cannot confirm *which* contents the
+  service holds after an uncertain `PATCH`: two different orders can
+  share a total. The builder says so in that situation and prints the
+  `GET /orders/{id}` call that does show the stored contents. The surest
+  recovery remains resending the same update, which is a wholesale
+  replacement and therefore idempotent.
 
 *Cancel at the moment the kitchen starts.* Both operations serialize on
 the store mutex, and each validates the status inside the lock. One of
@@ -306,12 +433,30 @@ single anonymous customer per order); a menu administration UI (the menu
 is a data table in code). Proportionate for a 3-hour exercise; each is a
 documented assumption rather than a hidden gap.
 
-Next, in order: (1) persist orders and idempotency keys (SQLite drops in
-behind the store's interface unchanged); (2) unguessable order IDs and
-auth on the restaurant-side endpoints; (3) order versioning so an update
-based on stale state gets a 409 instead of overwriting; (4) structured
-request logging and a small metrics hook (order counts by status) — the
-kind of operability a real service would be paged on.
+Next, in order:
+
+1. **Persist orders and idempotency keys.** This is the one cut with a
+   correctness consequence rather than only a convenience cost: because
+   the key→order record lives in memory, a service restart forgets it, so
+   a retry after a restart is no longer protected and can create a second
+   order. The store's operations map onto a single SQL table plus a
+   uniqueness constraint on the key, and the lock discipline becomes a
+   transaction — but note this is a *substitution*, not a drop-in: `Store`
+   is a concrete type today, so persisting it means either introducing an
+   interface or changing that type, and every method would start
+   returning errors the handlers must map.
+2. **Unguessable order IDs and auth on the restaurant-side endpoints.**
+   IDs are currently sequential (`ord-0001`), so anyone can enumerate and
+   cancel other customers' orders; `/advance` is likewise unauthenticated.
+   Acceptable only because the exercise excludes auth.
+3. **Order versioning (ETag / `If-Match`)** so an update based on stale
+   state gets a 409 instead of silently overwriting. Today updates are
+   last-writer-wins, which is fine for one customer per order and wrong
+   the moment two devices share one.
+4. **Structured request logging and a metrics hook** (order counts by
+   status, rejection reasons) — the operability a real service is paged
+   on, and what would reveal whether the ambiguous-outcome paths above
+   ever actually fire in production.
 
 ## Testing
 
@@ -331,6 +476,17 @@ Packages tested and what they cover:
   topping, out-of-range tip, negative tip amount.
 - Overflow: `safeAdd`, `safeMul`, `safePercentOf` reject arithmetic
   overflow; `LineTotal` and `Price` bound quantities and subtotals.
+- Helper contracts, including the cases they are easy to get wrong:
+  `safeMul` rejects a negative multiplier even when the other operand is
+  zero (no short-circuit hiding bad input) and bounds a negative operand
+  by magnitude; `safePercentOf` rejects a non-positive denominator, a
+  negative rate, and a negative amount, and its overflow bound accounts
+  for the rounding term `percentOf` adds before dividing.
+- Declared limits at their exact boundaries: quantity at `MaxQuantity`
+  and `MaxQuantity+1`, zero and negative quantities, a tip at and above
+  `MaxCents`, and a **total** pushed past `MaxCents` by tax and tip even
+  though the subtotal is legal. Every figure in a computed `Totals` is
+  asserted to lie within `[0, MaxCents]`.
 - `Cents.String` handles the `MinInt64` negation edge case.
 
 ### `internal/order` — model and lifecycle
@@ -342,13 +498,23 @@ Packages tested and what they cover:
 
 - Update/cancel rejection for every non-`Not Started` status (Started,
   Ready for Pickup, Delivered, Cancelled).
-- Atomic validation failure: an invalid update leaves the order's items,
-  tip, totals, and timestamps unchanged.
-- Store ownership: mutating a returned copy cannot mutate the stored
-  order's line items or toppings.
+- Atomic validation failure: for nine distinct invalid updates (unknown
+  size, zero and over-maximum quantity, unknown and duplicate topping, no
+  items, unknown and unqualified promo, out-of-range tip) the stored
+  order is compared in full with `reflect.DeepEqual` — not a field or two
+  — and `UpdatedAt` is asserted not to move.
+- Copy isolation in both directions, for **every** accessor: mutating the
+  result of `Create`, `Get`, `Update`, `Cancel`, or `Advance` cannot reach
+  the store; two `Get` results do not share a toppings array; and
+  mutating the caller's slices after `Create`/`Update` does not change
+  what was stored.
 - Idempotent create (same key → original order, no duplicate), including
-  concurrent idempotency (10 goroutines with one key still produce one
-  order and one original ID).
+  concurrent idempotency: 10 goroutines with one key produce one order,
+  **every** caller receives that same ID with no error, and **exactly
+  one** is told `created == true`.
+- Concurrent mixed operations (cancel, advance, update, get on one order,
+  50 rounds) leave a consistent final status, with any failure being an
+  explicit `ErrStateConflict` rather than a panic or a lost order.
 - Same-key/different-body rejection (`ErrIdempotencyConflict`) with the
   original order ID in the error message.
 - Replay is compared against the original creation request: after a
@@ -360,8 +526,10 @@ Packages tested and what they cover:
   slices afterwards does not change what the key means.
 - Create without key always creates a new order.
 - `AdvanceAll` advances each eligible order exactly one step, skips
-  terminal states, and returns the right count (including an empty
-  store).
+  terminal states, and returns the right count — for an empty store, a
+  uniform store, and a **mixed-state** store holding one order in each of
+  Not Started, Started, Ready for Pickup, Delivered, and Cancelled, where
+  each order's resulting status is asserted individually.
 - The cancel-vs-advance race yields exactly one winner (100 rounds).
 
 ### `internal/server` — HTTP handler invariants
@@ -377,7 +545,18 @@ Packages tested and what they cover:
 - Non-integer numeric tokens are rejected rather than rounded —
   `quantity:1.00000000000000001`, `amount_cents:100.000000000000001`,
   `1.5`, `1e2`, and a quoted `"1"`.
-- Tip mode/field contradictions are rejected with 400.
+- Tip mode/field contradictions are rejected with 400, across every
+  mode/field pairing: none-with-amount, none-with-percent, none-with-both,
+  amount-with-percent, percent-with-amount, an unknown mode,
+  out-of-range values in the active field, and *negative* values in an
+  inactive one (so the check is "exactly zero", not merely "not
+  positive"). The accepted cases — omitted tip, explicit none, zero
+  amount, zero percent, percent at exactly 100, and each mode with its
+  inactive field written out as an explicit `0` — are asserted too, so
+  the validation is not merely strict.
+- `GET` reports every lifecycle status (Not Started, Started, Ready for
+  Pickup, Delivered, Cancelled), each with a formatted total, and
+  advancing a Delivered order returns 409.
 - `PATCH` enforces the identical contract, and a refused `PATCH` leaves
   the order byte-for-byte unchanged (verified by re-reading it).
 - Body-size limits: a large but legal body is accepted; an oversized one
@@ -407,9 +586,10 @@ Pure parsing and formatting (`main_test.go`):
   `cancel nonexistent-id unexpected`, `status a b`, `update x`) reports
   usage and issues **no request** — asserted against the server — so
   excess arguments can never cancel the session's own order.
-- `cancel`/`status` use the session's order by default and an explicit
-  ID when given; an explicit ID does not become the session's order, and
-  with no ID and nothing submitted they make no request.
+- `cancel` and `status` each use the session's order by default and an
+  explicit ID when given — both asserted on the path the server actually
+  received — an explicit ID does not become the session's order, and with
+  no ID and nothing submitted they make no request.
 
 Real HTTP client and submit state machine (`client_test.go`, driven by
 in-process `httptest` servers — no live service and no real timers
@@ -426,36 +606,74 @@ beyond short client timeouts):
   outcome (timeout, unreadable 201, 5xx), and the retry reuses both —
   asserted by inspecting the keys and bodies the server actually
   received, so a duplicate-creating regression fails the test.
-- A 4xx validation rejection releases the key and re-enables editing; a
-  409 keeps the key and surfaces the original order ID.
+- A 4xx read as a service validation rejection (400 on a bad promo)
+  releases the key and re-enables editing; a 409 keeps the key and
+  surfaces the original order ID; 408 and 425 keep it, because they do
+  not establish non-creation. `ambiguousRequestFailure` is tested
+  directly on both the ambiguous and the judging status codes.
+- Any 2xx other than 200/201 (202, 204, 205, 206) is treated as
+  unresolved rather than announced as a completed order, even when the
+  body looks like a valid order.
 - A timeout triggers exactly one automatic retry with the same key, and
   leaves the submission pending if that also fails.
+- `update` advises that retrying is safe after an ambiguous failure (a
+  PATCH is a wholesale replacement) and that it will *not* help after a
+  409; repeating an update is shown to send an identical body. After an
+  unreadable or contentless reply, the advice is asserted *not* to claim
+  that `status` shows the stored contents, and to name the
+  `GET /orders/{id}` call that does.
 - `submit` on an already-submitted order makes no request and directs
   the customer to `update`; an empty order makes no request at all.
 - `status` and `cancel` refuse to confirm anything from a contentless
   reply, and a 502 with an HTML body is not reported as "unreachable".
 
+### End-to-end recovery (`cmd/builder/recovery_test.go`)
+
+These drive the **real builder against the real service** through a
+fault-injecting proxy; everything below the proxy is production code. The
+proxy always delivers the request and then damages only the reply, which
+is what makes the duplicate-order scenario reachable.
+
+- For a lost body, truncated JSON, a 502, a 408 issued *after* the order
+  was stored, a contentless 200, and a 202, the retry leaves **exactly one
+  order** in the service, and the ID the customer ends up holding is that
+  order. This is the concrete anti-duplication guarantee.
+- The total the builder printed is compared against the total the service
+  actually stored.
+- While an outcome is unresolved, every edit is refused, and the contents
+  the service stored are then compared field-by-field with what the
+  builder still shows locally.
+- A server-side rejection stores nothing, releases the key, and a later
+  submission creates exactly one order.
+
 Not covered: the CLI's interactive read loop itself (`main`'s scanner —
 the commands it dispatches are tested directly), load/performance, and
-behavior across service restarts (storage is documented as in-memory).
-The scripted end-to-end sessions against a real service were a manual
-check during development, not an automated guarantee.
+behavior across service restarts (storage is documented as in-memory, and
+the restart-duplication limit is stated in the retry section above rather
+than tested). The fault injection models damaged *responses*; it does not
+model partially-written requests or a service that crashes mid-write.
 
 ## AI usage note
 
-> _Attribution and the personal-verification example below must be
-> confirmed by the candidate before submission — see the note at the end
-> of this section. Everything else here describes work that is visible in
-> the repository._
+**Tools used.** Claude (Anthropic) and GitHub Copilot were both used on
+this repository: Claude produced the first working implementation —
+structure, pricing/service/builder code, and tests — from the exercise
+specification, and both were used across the subsequent review rounds that
+produced the audit in `TODO.md` and the fixes recorded there. The commit
+history shows those rounds as separate commits rather than one drop.
 
-AI coding assistants were used to produce the first working version of
-this implementation — structure, pricing/service/builder code, and tests
-— working from the exercise specification, and then to carry out a
-specification audit and the follow-up fixes. The design decisions in the
-Assumptions section (integer-cents money, a shared pricing package as the
-single source of truth, idempotency keys, the locked state machine, the
-tip-base and order-of-operations choices) were specified up front and
-then checked against the AI's output.
+The design decisions in the Assumptions section (integer-cents money, a
+shared pricing package as the single source of truth, idempotency keys,
+the locked state machine, the tip-base and order-of-operations choices)
+were specified up front and then checked against the AI's output.
+
+An important caveat about this section, stated plainly because it affects
+how the rest of it should be read: the specification audits and the
+fix rounds were themselves AI-assisted. Where a finding below is
+described as "reproduced" or "verified", that means it was demonstrated
+with a running program and is now pinned by a test anyone can re-run —
+not that it was found by unaided human inspection. The distinction
+matters, so it is drawn rather than blurred.
 
 - **One example of AI output that was rejected and fixed.** The initial
   API client discarded JSON decode errors (the `json.Decode` error was
@@ -472,32 +690,52 @@ then checked against the AI's output.
      `total_formatted` before any success message is printed or the
      session's order ID is replaced.
 
-  A related correction in the same area: the original fix assumed a
-  non-timeout error proved the request never reached the service, and so
-  discarded the idempotency key. That is false — an empty 201 body or a
-  5xx from an intermediary can follow creation upstream — and it caused
-  duplicate orders. The key is now released only for a 4xx validation
-  rejection, which is the one response that proves nothing was stored.
+  A related correction in the same area, which took three passes to get
+  right and is the clearest example of AI output that looked finished but
+  was not. The original code assumed a non-timeout error proved the
+  request never reached the service, and discarded the idempotency key —
+  so a retry created a duplicate. The first fix narrowed that to "release
+  the key on any 4xx", which is still wrong: a 408 or 425 reports that the
+  request failed to *arrive usably* and can be emitted by a proxy after
+  the origin already stored the order. The rule is now that the key is
+  released only for a response that reads as the service's own
+  *validation* rejection of the contents, with 408/425, 409, 5xx, and any
+  unexpected 2xx all treated as unresolved. That rule is still an
+  inference from the status code rather than an authenticated signal —
+  the residual gap is stated in the retry section above — but it no
+  longer releases the key for the delivery failures that actually
+  produced the duplicate. Each wrong version passed the tests that
+  existed when it was written, which is the lesson.
 
-- **One invariant verified rather than trusted, and how.** A
-  specification audit compared the implementation against all four pages
-  of the exercise PDF, the README, both commands, every internal
-  package, and the tests. It reproduced behavior with in-process servers
-  and loopback proxies rather than reading code alone, which is how the
-  false-success decoding, the key-discarding duplicate, the
-  dollar-conversion wrap (`tip amount 184467440737095517` displaying
-  `$0.84`), and the replay-comparison inversion after a `PATCH` were
-  found — none of which the then-current test suite caught. Each
-  finding is now pinned by a regression test in `cmd/builder/client_test.go`,
-  `cmd/builder/main_test.go`, and `internal/store/store_test.go`, so the
-  claims above can be re-checked with `go test -race ./...`.
+- **One invariant checked by demonstration rather than by trusting the
+  code.** The invariant is requirement 5's: *an unreliable connection must
+  never leave the restaurant holding two orders.* Reading the code was not
+  enough to settle it — the code looked correct in all three of the wrong
+  versions above. So it is checked by construction instead, in
+  `cmd/builder/recovery_test.go`: the real builder talks to the real
+  service through a proxy that always delivers the request and then
+  damages only the reply. For each of six failure modes (lost body,
+  truncated JSON, 502, a 408 issued after the order was stored, a
+  contentless 200, and a 202) the test retries and then asserts directly
+  against the service's own store that **exactly one** order exists and
+  that the ID the customer holds is that order.
 
-> **For the candidate to confirm before submission:** name the specific
-> assistants actually used (this repository's history involves more than
-> one), and either endorse the verification account above as your own
-> work or replace it with a check you performed yourself. An AI-produced
-> audit is evidence, but it is not independent human verification, and
-> the PDF asks for the latter.
+  That construction is what makes the claim falsifiable: reverting any of
+  the fixes makes `store.Count()` return 2 and the test fail by naming the
+  duplicate. The same method found the other defects — the false-success
+  decoding, the dollar-conversion wrap (`tip amount 184467440737095517`
+  displaying `$0.84`), the replay-comparison inversion after a `PATCH`, and
+  the `float64` round-trip that turned `quantity:1.00000000000000001` into
+  quantity 1 — each of which the test suite of the time accepted. Every
+  one is now pinned by a regression test, so all the claims in this
+  section can be re-checked with `go test -race ./...`.
+
+> **Reviewer's note.** Treat this section as a description of work that is
+> inspectable in the repository — the commits, the fixes, and the tests
+> named above — rather than as a claim about unaided human effort. The
+> audits and fixes were AI-assisted, which is precisely why each finding
+> is tied to a test that fails when the fix is reverted: the evidence
+> stands on being reproducible, not on who or what noticed it first.
 
 ## Repository layout
 

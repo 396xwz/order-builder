@@ -354,6 +354,116 @@ func TestSubmitReleasesKeyOnValidationRejection(t *testing.T) {
 	}
 }
 
+// A 408/425 reports that the request did not arrive usably; it does NOT
+// prove the order was never stored (a proxy can emit 408 after the origin
+// accepted it). Releasing the key here is how a retry creates a duplicate.
+func TestSubmitKeepsKeyOnAmbiguousRequestFailure(t *testing.T) {
+	for _, status := range []int{http.StatusRequestTimeout, http.StatusTooEarly} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			h := &recordingHandler{respond: func(w http.ResponseWriter, r *http.Request, attempt int) {
+				if attempt == 1 {
+					w.WriteHeader(status)
+					_, _ = w.Write([]byte(`{"error":"request timed out"}`))
+					return
+				}
+				// The order had in fact been stored; the retry replays it.
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"id":"ord-0001","status":"Not Started","total_formatted":"$5.33"}`))
+			}}
+			s, out := newTestSession(t, h)
+
+			s.submit()
+
+			if s.idemKey == "" {
+				t.Fatalf("HTTP %d discarded the idempotency key; a retry could duplicate the order", status)
+			}
+			if !s.hasPending() {
+				t.Errorf("HTTP %d must leave the submission pending", status)
+			}
+			if s.orderID != "" {
+				t.Errorf("orderID = %q, want it left empty", s.orderID)
+			}
+			if strings.Contains(out.String(), "No order was created") {
+				t.Errorf("HTTP %d must not claim nothing was created: %q", status, out.String())
+			}
+			firstKey := s.idemKey
+
+			// The retry reuses the key and recovers the original order.
+			s.submit()
+			keys, bodies := h.recorded()
+			if len(keys) != 2 || keys[0] != keys[1] || s.idemKey != firstKey {
+				t.Errorf("retry did not reuse the key: keys=%v session=%q", keys, s.idemKey)
+			}
+			if bodies[0] != bodies[1] {
+				t.Errorf("retry changed the body:\n%s\n%s", bodies[0], bodies[1])
+			}
+			if s.orderID != "ord-0001" {
+				t.Errorf("orderID = %q, want ord-0001", s.orderID)
+			}
+		})
+	}
+}
+
+// Only 200 and 201 are defined submission outcomes. Any other 2xx —
+// notably 202 Accepted, which means "queued, not yet stored" — must not be
+// announced as a completed order.
+func TestSubmitRejectsUnexpectedSuccessStatus(t *testing.T) {
+	for _, status := range []int{
+		http.StatusAccepted,
+		http.StatusNoContent,
+		http.StatusResetContent,
+		http.StatusPartialContent,
+	} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			h := &recordingHandler{respond: func(w http.ResponseWriter, r *http.Request, attempt int) {
+				w.WriteHeader(status)
+				// A complete, valid-looking order body: the status alone
+				// must be enough to withhold the success message.
+				_, _ = w.Write([]byte(`{"id":"ord-0001","status":"Not Started","total_formatted":"$5.33"}`))
+			}}
+			s, out := newTestSession(t, h)
+
+			s.submit()
+
+			if strings.Contains(out.String(), "submitted. Status:") {
+				t.Errorf("HTTP %d was announced as a completed submission: %q", status, out.String())
+			}
+			if s.orderID != "" {
+				t.Errorf("HTTP %d set orderID to %q; it must stay empty", status, s.orderID)
+			}
+			if !s.hasPending() {
+				t.Errorf("HTTP %d must leave the submission pending", status)
+			}
+			if s.idemKey == "" {
+				t.Errorf("HTTP %d discarded the idempotency key", status)
+			}
+			if !strings.Contains(out.String(), "may or may not have been created") {
+				t.Errorf("output should explain the unresolved outcome, got %q", out.String())
+			}
+		})
+	}
+}
+
+func TestAmbiguousRequestFailureClassification(t *testing.T) {
+	for _, status := range []int{http.StatusRequestTimeout, http.StatusTooEarly} {
+		if !ambiguousRequestFailure(status) {
+			t.Errorf("ambiguousRequestFailure(%d) = false, want true", status)
+		}
+	}
+	for _, status := range []int{
+		http.StatusBadRequest,
+		http.StatusNotFound,
+		http.StatusConflict,
+		http.StatusUnprocessableEntity,
+		http.StatusOK,
+		http.StatusInternalServerError,
+	} {
+		if ambiguousRequestFailure(status) {
+			t.Errorf("ambiguousRequestFailure(%d) = true, want false", status)
+		}
+	}
+}
+
 // A 409 proves the key IS already used, so it must be kept, and the
 // original order ID must be surfaced rather than lost.
 func TestSubmitKeepsKeyOnIdempotencyConflict(t *testing.T) {
@@ -483,6 +593,71 @@ func TestSubmitEmptyOrderMakesNoRequest(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// update: recovery advice must match what retrying actually does
+// ---------------------------------------------------------------------------
+
+// A PATCH replaces the whole order, so applying it twice equals applying
+// it once. The advice after an uncertain update must say retrying is safe,
+// and a 409 must say the opposite, because the order is past changing.
+func TestUpdateRecoveryAdvice(t *testing.T) {
+	t.Run("ambiguous failure says retrying is safe", func(t *testing.T) {
+		h := &recordingHandler{respond: func(w http.ResponseWriter, r *http.Request, attempt int) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"error":"upstream unavailable"}`))
+		}}
+		s, out := newTestSession(t, h)
+		s.orderID = "ord-0001"
+
+		s.update()
+
+		if !strings.Contains(out.String(), "safe") {
+			t.Errorf("output should say retrying is safe, got %q", out.String())
+		}
+	})
+
+	t.Run("conflict says retrying will not help", func(t *testing.T) {
+		h := &recordingHandler{respond: func(w http.ResponseWriter, r *http.Request, attempt int) {
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"error":"order ord-0001 is \"Started\""}`))
+		}}
+		s, out := newTestSession(t, h)
+		s.orderID = "ord-0001"
+
+		s.update()
+
+		if !strings.Contains(out.String(), "will not help") {
+			t.Errorf("output should say retrying will not help, got %q", out.String())
+		}
+		if strings.Contains(out.String(), "again is safe") {
+			t.Errorf("a 409 must not invite a retry: %q", out.String())
+		}
+	})
+
+	// The claim is true, not just printed: replaying the same update body
+	// leaves the order identical.
+	t.Run("repeating an update is genuinely idempotent", func(t *testing.T) {
+		var bodies []string
+		h := &recordingHandler{respond: func(w http.ResponseWriter, r *http.Request, attempt int) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"id":"ord-0001","status":"Not Started","total_formatted":"$16.29"}`))
+		}}
+		s, _ := newTestSession(t, h)
+		s.orderID = "ord-0001"
+
+		s.update()
+		s.update()
+
+		_, bodies = h.recorded()
+		if len(bodies) != 2 {
+			t.Fatalf("server saw %d requests, want 2", len(bodies))
+		}
+		if bodies[0] != bodies[1] {
+			t.Errorf("repeated updates sent different bodies:\n%s\n%s", bodies[0], bodies[1])
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
 // Command arity: invalid arguments must not reach the network
 // ---------------------------------------------------------------------------
 
@@ -565,6 +740,90 @@ func TestCancelDefaultAndExplicitID(t *testing.T) {
 			t.Errorf("session orderID changed to %q", s.orderID)
 		}
 	})
+}
+
+// The successful routing paths for `status`: the session's own order by
+// default, an explicit ID when given, and — like cancel — an explicit ID
+// must not become the session's order.
+func TestStatusDefaultAndExplicitID(t *testing.T) {
+	t.Run("default id", func(t *testing.T) {
+		var paths []string
+		h := &recordingHandler{respond: func(w http.ResponseWriter, r *http.Request, attempt int) {
+			paths = append(paths, r.URL.Path)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"id":"ord-0001","status":"Started","total_formatted":"$5.33"}`))
+		}}
+		s, out := newTestSession(t, h)
+		s.orderID = "ord-0001"
+
+		s.dispatch("status")
+
+		if len(paths) != 1 || paths[0] != "/orders/ord-0001" {
+			t.Errorf("requested paths = %v, want one /orders/ord-0001", paths)
+		}
+		if !strings.Contains(out.String(), "Order ord-0001 — status: Started — total: $5.33") {
+			t.Errorf("output = %q", out.String())
+		}
+	})
+
+	t.Run("explicit id", func(t *testing.T) {
+		var paths []string
+		h := &recordingHandler{respond: func(w http.ResponseWriter, r *http.Request, attempt int) {
+			paths = append(paths, r.URL.Path)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"id":"ord-0042","status":"Delivered","total_formatted":"$9.99"}`))
+		}}
+		s, out := newTestSession(t, h)
+		s.orderID = "ord-0001"
+
+		s.dispatch("status ord-0042")
+
+		if len(paths) != 1 || paths[0] != "/orders/ord-0042" {
+			t.Errorf("requested paths = %v, want one /orders/ord-0042", paths)
+		}
+		if !strings.Contains(out.String(), "ord-0042") {
+			t.Errorf("output = %q", out.String())
+		}
+		// Looking someone else's order up must not adopt its ID.
+		if s.orderID != "ord-0001" {
+			t.Errorf("session orderID changed to %q", s.orderID)
+		}
+	})
+}
+
+// `status` deliberately reports only ID, lifecycle status, and total. The
+// advice given after an uncertain update must not claim it shows contents,
+// because identical totals can represent different items.
+func TestUncertainUpdateAdviceDoesNotPromiseContents(t *testing.T) {
+	for name, respond := range map[string]func(w http.ResponseWriter, r *http.Request, attempt int){
+		"unreadable reply": func(w http.ResponseWriter, r *http.Request, attempt int) {
+			w.WriteHeader(http.StatusOK) // 200 with no body at all
+		},
+		"contentless reply": func(w http.ResponseWriter, r *http.Request, attempt int) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := &recordingHandler{respond: respond}
+			s, out := newTestSession(t, h)
+			s.orderID = "ord-0001"
+
+			s.update()
+
+			got := out.String()
+			if strings.Contains(got, "current contents") || strings.Contains(got, "what the service currently holds") {
+				t.Errorf("advice claims 'status' shows the stored contents: %q", got)
+			}
+			if !strings.Contains(got, "not its items, tip, or promo") {
+				t.Errorf("advice should say what 'status' omits, got %q", got)
+			}
+			// It must point at the one call that does show contents.
+			if !strings.Contains(got, "GET "+s.client.base+"/orders/ord-0001") {
+				t.Errorf("advice should name the GET that reveals contents, got %q", got)
+			}
+		})
+	}
 }
 
 // With no submitted order and no argument, cancel/status must not guess.

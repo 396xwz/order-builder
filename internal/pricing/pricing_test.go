@@ -119,6 +119,137 @@ func TestPriceOverflow(t *testing.T) {
 	}
 }
 
+// The declared contracts of the safe* helpers, including the cases the
+// earlier implementations got wrong.
+func TestSafeHelperContracts(t *testing.T) {
+	t.Run("safeMul rejects a negative multiplier even when a is zero", func(t *testing.T) {
+		// A short-circuit on a == 0 would hide this, making input
+		// validation depend on unrelated data.
+		if got, err := safeMul(0, -1); err == nil {
+			t.Errorf("safeMul(0, -1) = (%d, nil), want an error", got)
+		}
+	})
+
+	t.Run("safeMul bounds a negative a by magnitude", func(t *testing.T) {
+		// Comparing against MaxInt64/a with a negative a yields a negative
+		// quotient, which would accept every b and wrap.
+		if got, err := safeMul(Cents(math.MinInt64/2), 4); err == nil {
+			t.Errorf("safeMul(MinInt64/2, 4) = (%d, nil), want an overflow error", got)
+		}
+		// A legal negative multiplication still works.
+		if got, err := safeMul(-100, 3); err != nil || got != -300 {
+			t.Errorf("safeMul(-100, 3) = (%d, %v), want (-300, nil)", got, err)
+		}
+	})
+
+	t.Run("safePercentOf validates its rate arguments", func(t *testing.T) {
+		if _, err := safePercentOf(100, 10, 0); err == nil {
+			t.Error("safePercentOf with den == 0: want an error, got nil")
+		}
+		if _, err := safePercentOf(100, 10, -100); err == nil {
+			t.Error("safePercentOf with negative den: want an error, got nil")
+		}
+		if _, err := safePercentOf(100, -10, 100); err == nil {
+			t.Error("safePercentOf with a negative rate: want an error, got nil")
+		}
+	})
+
+	t.Run("safePercentOf accounts for the rounding term", func(t *testing.T) {
+		// |c|*num fits exactly, but percentOf also adds den/2 before
+		// dividing; a check that ignored that term would accept this and
+		// overflow inside percentOf.
+		den := int64(1000)
+		c := Cents((math.MaxInt64 - den/2) / 65 * 65)
+		if _, err := safePercentOf(c+1000, 65, den); err == nil {
+			t.Error("safePercentOf at the rounding boundary: want an overflow error, got nil")
+		}
+		// Well inside the bound still succeeds.
+		if got, err := safePercentOf(1428, 65, 1000); err != nil || got != 93 {
+			t.Errorf("safePercentOf(1428, 65, 1000) = (%d, %v), want (93, nil)", got, err)
+		}
+	})
+
+	// percentOf's round-half-up rule only holds for a non-negative input:
+	// the `+ den/2` term rounds a negative value half toward zero instead
+	// (10% of -$10.00 would yield -99¢, not -100¢). Rather than return a
+	// figure rounded by an undocumented second rule, safePercentOf refuses.
+	t.Run("safePercentOf rejects a negative amount", func(t *testing.T) {
+		if got, err := safePercentOf(-1000, 10, 100); err == nil {
+			t.Errorf("safePercentOf(-1000, 10, 100) = (%d, nil), want an error", got)
+		}
+		if got, err := safePercentOf(0, 10, 100); err != nil || got != 0 {
+			t.Errorf("safePercentOf(0, 10, 100) = (%d, %v), want (0, nil)", got, err)
+		}
+	})
+}
+
+// The documented limits are enforced at their exact boundaries.
+func TestDeclaredLimitBoundaries(t *testing.T) {
+	t.Run("quantity", func(t *testing.T) {
+		if _, err := LineTotal(LineItem{Size: "Small", Quantity: MaxQuantity}); err != nil {
+			t.Errorf("quantity at MaxQuantity: unexpected error %v", err)
+		}
+		if _, err := LineTotal(LineItem{Size: "Small", Quantity: MaxQuantity + 1}); err == nil {
+			t.Error("quantity at MaxQuantity+1: want an error, got nil")
+		}
+		if _, err := LineTotal(LineItem{Size: "Small", Quantity: 0}); err == nil {
+			t.Error("quantity 0: want an error, got nil")
+		}
+		if _, err := LineTotal(LineItem{Size: "Small", Quantity: -1}); err == nil {
+			t.Error("negative quantity: want an error, got nil")
+		}
+	})
+
+	t.Run("tip amount", func(t *testing.T) {
+		items := []LineItem{{Size: "Small", Quantity: 1}}
+		if _, err := Price(items, Tip{Mode: TipAmount, Amount: MaxCents}, ""); err == nil {
+			t.Error("a tip of MaxCents pushes the total over the limit: want an error")
+		}
+		if _, err := Price(items, Tip{Mode: TipAmount, Amount: MaxCents + 1}, ""); err == nil {
+			t.Error("tip above MaxCents: want an error, got nil")
+		}
+	})
+
+	// A subtotal inside the limit can still produce a total above it once
+	// tax and a dollar tip are added; the final charge must be bounded too.
+	t.Run("total is bounded, not only the subtotal", func(t *testing.T) {
+		// 1,000,000 Large pizzas = $12,000,000.00 — a legal subtotal.
+		items := []LineItem{{Size: "Large", Quantity: MaxQuantity}}
+		totals, err := Price(items, Tip{}, "")
+		if err != nil {
+			t.Fatalf("legal large order rejected: %v", err)
+		}
+		if totals.Subtotal > MaxCents || totals.Total > MaxCents {
+			t.Errorf("totals exceed MaxCents: %+v", totals)
+		}
+		// Now add a tip that pushes the *total* past the limit while the
+		// subtotal stays legal.
+		if _, err := Price(items, Tip{Mode: TipAmount, Amount: MaxCents - 1}, ""); err == nil {
+			t.Error("a total above MaxCents was accepted; want an error")
+		}
+	})
+
+	t.Run("every reported figure stays within the limits", func(t *testing.T) {
+		items := []LineItem{{Size: "Large", Quantity: 3, Toppings: []string{"Bacon", "Pepperoni"}}}
+		totals, err := Price(items, Tip{Mode: TipPercent, Percent: 100}, "")
+		if err != nil {
+			t.Fatalf("Price: %v", err)
+		}
+		for name, v := range map[string]Cents{
+			"subtotal": totals.Subtotal,
+			"discount": totals.Discount,
+			"taxable":  totals.Taxable,
+			"tax":      totals.Tax,
+			"tip":      totals.Tip,
+			"total":    totals.Total,
+		} {
+			if v < 0 || v > MaxCents {
+				t.Errorf("%s = %s, outside [0, %s]", name, v, MaxCents)
+			}
+		}
+	})
+}
+
 func TestPercentOfOverflow(t *testing.T) {
 	// safePercentOf should reject overflow cases.
 	// With 10% of MaxInt64, the multiplication overflows.

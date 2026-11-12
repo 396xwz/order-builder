@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -334,83 +335,292 @@ func TestUpdateCancelRejectedInAllTerminalStates(t *testing.T) {
 	})
 }
 
+// A failed update must leave the order *entirely* untouched — every field,
+// including UpdatedAt, not merely the total and the first item's size.
 func TestAtomicValidationFailureLeavesStateUnchanged(t *testing.T) {
 	s := New()
-	in := order.Input{Items: []pricing.LineItem{{Size: "Small", Quantity: 1}}, Tip: pricing.Tip{Mode: pricing.TipAmount, Amount: 100}}
+	in := order.Input{
+		Items: []pricing.LineItem{{Size: "Small", Quantity: 1, Toppings: []string{"Bacon"}}},
+		Tip:   pricing.Tip{Mode: pricing.TipAmount, Amount: 100},
+	}
 	o := mustCreate(t, s, in, "")
-	original := o.Totals.Total
-
-	// Try an invalid update (unknown size).
-	bad := order.Input{Items: []pricing.LineItem{{Size: "Huge", Quantity: 1}}}
-	_, err := s.Update(o.ID, bad)
-	if err == nil {
-		t.Fatal("expected error for invalid update")
-	}
-
-	// Re-read and verify unchanged.
-	got, ok := s.Get(o.ID)
-	if !ok {
-		t.Fatal("order should still exist")
-	}
-	if got.Totals.Total != original {
-		t.Errorf("total changed from %s to %s after failed update", original, got.Totals.Total)
-	}
-	if len(got.Items) != 1 || got.Items[0].Size != "Small" {
-		t.Errorf("items changed after failed update: %+v", got.Items)
-	}
-}
-
-func TestStoreOwnershipPreventsExternalMutation(t *testing.T) {
-	s := New()
-	o := mustCreate(t, s, smallOrder(), "")
-	// Mutate the returned copy.
-	o.Items[0].Quantity = 999
-	o.Tip.Amount = 99999
-
-	// The stored order must be unchanged.
-	got, ok := s.Get(o.ID)
+	before, ok := s.Get(o.ID)
 	if !ok {
 		t.Fatal("order should exist")
 	}
-	if got.Items[0].Quantity == 999 {
-		t.Error("stored quantity changed after external mutation")
+
+	for name, bad := range map[string]order.Input{
+		"unknown size":      {Items: []pricing.LineItem{{Size: "Huge", Quantity: 1}}},
+		"zero quantity":     {Items: []pricing.LineItem{{Size: "Small", Quantity: 0}}},
+		"unknown topping":   {Items: []pricing.LineItem{{Size: "Small", Quantity: 1, Toppings: []string{"Gold"}}}},
+		"duplicate topping": {Items: []pricing.LineItem{{Size: "Small", Quantity: 1, Toppings: []string{"Bacon", "bacon"}}}},
+		"no items":          {Items: nil},
+		"unknown promo":     {Items: []pricing.LineItem{{Size: "Small", Quantity: 1}}, PromoCode: "NOPE"},
+		"unqualified promo": {Items: []pricing.LineItem{{Size: "Small", Quantity: 1}}, PromoCode: "SAVE5"},
+		"bad tip percent":   {Items: []pricing.LineItem{{Size: "Small", Quantity: 1}}, Tip: pricing.Tip{Mode: pricing.TipPercent, Percent: 101}},
+		"over max quantity": {Items: []pricing.LineItem{{Size: "Small", Quantity: pricing.MaxQuantity + 1}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := s.Update(o.ID, bad); err == nil {
+				t.Fatalf("Update with %s: want an error, got nil", name)
+			}
+			got, ok := s.Get(o.ID)
+			if !ok {
+				t.Fatal("order should still exist")
+			}
+			// Compare the whole order, not a couple of fields.
+			if !reflect.DeepEqual(got, before) {
+				t.Errorf("order changed after a failed update:\nbefore %+v\nafter  %+v", before, got)
+			}
+			if !got.UpdatedAt.Equal(before.UpdatedAt) {
+				t.Errorf("UpdatedAt moved on a failed update: %v -> %v", before.UpdatedAt, got.UpdatedAt)
+			}
+		})
 	}
-	if got.Tip.Amount == 99999 {
-		t.Error("stored tip changed after external mutation")
+
+	// A valid update afterwards still works.
+	if _, err := s.Update(o.ID, order.Input{Items: []pricing.LineItem{{Size: "Large", Quantity: 1}}}); err != nil {
+		t.Fatalf("valid update after failures: %v", err)
 	}
 }
 
+// Every accessor must hand back an isolated deep copy, in both directions:
+// mutating what a caller received cannot reach the store, and the store
+// must not retain a slice the caller passed in.
+func TestCopyIsolationForEveryAccessor(t *testing.T) {
+	fresh := func(t *testing.T) (*Store, string) {
+		t.Helper()
+		s := New()
+		in := order.Input{Items: []pricing.LineItem{{Size: "Small", Quantity: 1, Toppings: []string{"Bacon", "Pineapple"}}}}
+		return s, mustCreate(t, s, in, "").ID
+	}
+	sameItems := order.Input{Items: []pricing.LineItem{{Size: "Small", Quantity: 1, Toppings: []string{"Bacon", "Pineapple"}}}}
+
+	accessors := map[string]func(t *testing.T, s *Store, id string) *order.Order{
+		"Get": func(t *testing.T, s *Store, id string) *order.Order {
+			got, ok := s.Get(id)
+			if !ok {
+				t.Fatal("Get: order not found")
+			}
+			return got
+		},
+		"Update": func(t *testing.T, s *Store, id string) *order.Order {
+			got, err := s.Update(id, sameItems)
+			if err != nil {
+				t.Fatalf("Update: %v", err)
+			}
+			return got
+		},
+		"Cancel": func(t *testing.T, s *Store, id string) *order.Order {
+			got, err := s.Cancel(id)
+			if err != nil {
+				t.Fatalf("Cancel: %v", err)
+			}
+			return got
+		},
+		"Advance": func(t *testing.T, s *Store, id string) *order.Order {
+			got, err := s.Advance(id)
+			if err != nil {
+				t.Fatalf("Advance: %v", err)
+			}
+			return got
+		},
+	}
+	for name, get := range accessors {
+		t.Run("mutating the result of "+name, func(t *testing.T) {
+			s, id := fresh(t)
+			returned := get(t, s, id)
+
+			returned.Items[0].Quantity = 999
+			returned.Items[0].Size = "Tampered"
+			returned.Items[0].Toppings[0] = "Tampered"
+			returned.Tip = pricing.Tip{Mode: pricing.TipAmount, Amount: 99999}
+			returned.Status = "Tampered"
+			returned.Totals.Total = 123456
+
+			stored, ok := s.Get(id)
+			if !ok {
+				t.Fatal("order should exist")
+			}
+			if stored.Items[0].Quantity == 999 || stored.Items[0].Size == "Tampered" {
+				t.Errorf("stored item changed through the returned copy: %+v", stored.Items[0])
+			}
+			if stored.Items[0].Toppings[0] == "Tampered" {
+				t.Error("stored toppings array is shared with the returned copy")
+			}
+			if stored.Tip.Amount == 99999 {
+				t.Error("stored tip changed through the returned copy")
+			}
+			if stored.Status == "Tampered" || stored.Totals.Total == 123456 {
+				t.Errorf("stored status/totals changed through the returned copy: %+v", stored)
+			}
+		})
+	}
+
+	t.Run("separate reads are independent", func(t *testing.T) {
+		s, id := fresh(t)
+		first, _ := s.Get(id)
+		second, _ := s.Get(id)
+		first.Items[0].Toppings[0] = "Tampered"
+		if second.Items[0].Toppings[0] == "Tampered" {
+			t.Error("two Get results share a toppings array")
+		}
+	})
+
+	t.Run("caller input is copied on write", func(t *testing.T) {
+		s := New()
+		toppings := []string{"Bacon"}
+		in := order.Input{Items: []pricing.LineItem{{Size: "Small", Quantity: 1, Toppings: toppings}}}
+		o := mustCreate(t, s, in, "")
+		toppings[0] = "Tampered"
+		in.Items[0].Quantity = 999
+
+		stored, _ := s.Get(o.ID)
+		if stored.Items[0].Toppings[0] == "Tampered" {
+			t.Error("Create retained the caller's toppings array")
+		}
+		if stored.Items[0].Quantity == 999 {
+			t.Error("Create retained the caller's item array")
+		}
+
+		upTop := []string{"Pepperoni"}
+		upIn := order.Input{Items: []pricing.LineItem{{Size: "Large", Quantity: 2, Toppings: upTop}}}
+		if _, err := s.Update(o.ID, upIn); err != nil {
+			t.Fatalf("Update: %v", err)
+		}
+		upTop[0] = "Tampered"
+		upIn.Items[0].Quantity = 777
+
+		stored, _ = s.Get(o.ID)
+		if stored.Items[0].Toppings[0] == "Tampered" {
+			t.Error("Update retained the caller's toppings array")
+		}
+		if stored.Items[0].Quantity == 777 {
+			t.Error("Update retained the caller's item array")
+		}
+	})
+}
+
+// Concurrency: every caller must get a usable result, and exactly one may
+// be told it created the order. Counting distinct IDs alone would pass even
+// if most callers had failed outright.
 func TestConcurrentIdempotency(t *testing.T) {
 	const goroutines = 10
 	s := New()
 	start := make(chan struct{})
-	results := make(chan string, goroutines)
+
+	type result struct {
+		id      string
+		created bool
+		err     error
+	}
+	results := make(chan result, goroutines)
 
 	for i := 0; i < goroutines; i++ {
 		go func() {
 			<-start
-			o, _, err := s.Create(smallOrder(), "same-key")
+			o, created, err := s.Create(smallOrder(), "same-key")
 			if err != nil {
-				results <- ""
+				results <- result{err: err}
 				return
 			}
-			results <- o.ID
+			results <- result{id: o.ID, created: created}
 		}()
 	}
 	close(start)
 
 	ids := map[string]int{}
+	createdCount := 0
 	for i := 0; i < goroutines; i++ {
-		id := <-results
-		if id != "" {
-			ids[id]++
+		r := <-results
+		// No caller may fail: they all send an identical, valid request.
+		if r.err != nil {
+			t.Errorf("concurrent Create returned an error: %v", r.err)
+			continue
+		}
+		if r.id == "" {
+			t.Error("concurrent Create returned an empty order ID")
+			continue
+		}
+		ids[r.id]++
+		if r.created {
+			createdCount++
 		}
 	}
 	if len(ids) != 1 {
-		t.Errorf("got %d distinct order IDs, want exactly 1: %v", len(ids), ids)
+		t.Fatalf("got %d distinct order IDs, want exactly 1: %v", len(ids), ids)
+	}
+	// Every caller must have received that one ID.
+	for id, n := range ids {
+		if n != goroutines {
+			t.Errorf("order %s was returned %d times, want %d", id, n, goroutines)
+		}
+	}
+	// Exactly one caller created it; the rest are replays. Without this,
+	// every caller could claim creation.
+	if createdCount != 1 {
+		t.Errorf("%d callers reported created == true, want exactly 1", createdCount)
 	}
 	if s.Count() != 1 {
 		t.Errorf("store holds %d orders, want 1", s.Count())
+	}
+}
+
+// Concurrent mixed operations on one order must leave it consistent, with
+// every caller either succeeding or failing with an explicit conflict.
+func TestConcurrentMixedOperationsStayConsistent(t *testing.T) {
+	for round := 0; round < 50; round++ {
+		s := New()
+		o := mustCreate(t, s, smallOrder(), "")
+
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		errs := make(chan error, 4)
+
+		ops := []func() error{
+			func() error { _, err := s.Cancel(o.ID); return err },
+			func() error { _, err := s.Advance(o.ID); return err },
+			func() error { _, err := s.Update(o.ID, smallOrder()); return err },
+			func() error {
+				if _, ok := s.Get(o.ID); !ok {
+					return errors.New("Get could not find the order")
+				}
+				return nil
+			},
+		}
+		wg.Add(len(ops))
+		for _, op := range ops {
+			go func(op func() error) {
+				defer wg.Done()
+				<-start
+				errs <- op()
+			}(op)
+		}
+		close(start)
+		wg.Wait()
+		close(errs)
+
+		for err := range errs {
+			// Any failure must be an explicit lifecycle conflict — never a
+			// panic, a lost order, or an unrelated error.
+			if err != nil && !errors.Is(err, ErrStateConflict) {
+				t.Fatalf("round %d: unexpected error %v", round, err)
+			}
+		}
+
+		final, ok := s.Get(o.ID)
+		if !ok {
+			t.Fatalf("round %d: order disappeared", round)
+		}
+		switch final.Status {
+		case order.StatusNotStarted, order.StatusStarted, order.StatusCancelled:
+			// All reachable from a concurrent cancel/advance/update.
+		default:
+			t.Fatalf("round %d: unexpected final status %q", round, final.Status)
+		}
+		if s.Count() != 1 {
+			t.Fatalf("round %d: store holds %d orders, want 1", round, s.Count())
+		}
 	}
 }
 
@@ -439,6 +649,77 @@ func TestAdvanceAll(t *testing.T) {
 	// Fourth round: all are Delivered (terminal), should advance 0.
 	if n := s.AdvanceAll(); n != 0 {
 		t.Errorf("AdvanceAll after all delivered: %d, want 0", n)
+	}
+}
+
+// With orders spread across different statuses, AdvanceAll must move each
+// eligible one exactly one step, skip the terminal ones, and report the
+// right count. A uniform-state store cannot detect an implementation that
+// advances the wrong orders or double-advances.
+func TestAdvanceAllWithMixedStates(t *testing.T) {
+	s := New()
+
+	notStarted := mustCreate(t, s, smallOrder(), "")
+
+	started := mustCreate(t, s, smallOrder(), "")
+	if _, err := s.Advance(started.ID); err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+
+	ready := mustCreate(t, s, smallOrder(), "")
+	for i := 0; i < 2; i++ {
+		if _, err := s.Advance(ready.ID); err != nil {
+			t.Fatalf("Advance: %v", err)
+		}
+	}
+
+	delivered := mustCreate(t, s, smallOrder(), "")
+	for i := 0; i < 3; i++ {
+		if _, err := s.Advance(delivered.ID); err != nil {
+			t.Fatalf("Advance: %v", err)
+		}
+	}
+
+	cancelled := mustCreate(t, s, smallOrder(), "")
+	if _, err := s.Cancel(cancelled.ID); err != nil {
+		t.Fatalf("Cancel: %v", err)
+	}
+
+	// Three are advanceable; Delivered and Cancelled are terminal.
+	if n := s.AdvanceAll(); n != 3 {
+		t.Errorf("AdvanceAll advanced %d, want 3", n)
+	}
+
+	for _, want := range []struct {
+		id     string
+		status order.Status
+	}{
+		{notStarted.ID, order.StatusStarted},
+		{started.ID, order.StatusReadyForPickup},
+		{ready.ID, order.StatusDelivered},
+		{delivered.ID, order.StatusDelivered}, // unchanged
+		{cancelled.ID, order.StatusCancelled}, // unchanged
+	} {
+		got, ok := s.Get(want.id)
+		if !ok {
+			t.Fatalf("order %s disappeared", want.id)
+		}
+		if got.Status != want.status {
+			t.Errorf("order %s = %q, want %q", want.id, got.Status, want.status)
+		}
+	}
+
+	// Only the two still-advanceable orders move next time.
+	if n := s.AdvanceAll(); n != 2 {
+		t.Errorf("second AdvanceAll advanced %d, want 2", n)
+	}
+	// A cancelled order is never advanced, however many rounds run.
+	for i := 0; i < 3; i++ {
+		s.AdvanceAll()
+	}
+	got, _ := s.Get(cancelled.ID)
+	if got.Status != order.StatusCancelled {
+		t.Errorf("cancelled order became %q", got.Status)
 	}
 }
 

@@ -589,6 +589,20 @@ func isTimeout(err error) bool {
 	return errors.As(err, &ne) && ne.Timeout()
 }
 
+// ambiguousRequestFailure reports whether a 4xx status describes a failure
+// to *deliver or read the request* rather than a decision to refuse it.
+// These say nothing about whether the order was stored:
+//
+//   - 408 Request Timeout: the request did not arrive in time, but a proxy
+//     can emit this after the origin already accepted and stored the order.
+//   - 425 Too Early: the request was replayed too soon and may be retried;
+//     it is explicitly not a judgement about the request's content.
+//
+// Callers must treat these as unresolved and keep the idempotency key.
+func ambiguousRequestFailure(status int) bool {
+	return status == http.StatusRequestTimeout || status == http.StatusTooEarly
+}
+
 func newIdemKey() string {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -605,13 +619,18 @@ func newIdemKey() string {
 // risking a duplicate: the service returns the original order for a key it
 // has already seen.
 //
-// Key/snapshot lifetime is the heart of this function. The key is only
-// cleared when non-creation is actually *established* — a 4xx validation
-// rejection, which the service emits before it stores anything. Every other
-// failure (timeout, body-read error, connection reset, 5xx from an
-// intermediary) is ambiguous: the order may well have been created and the
-// reply lost, so the key and the submitted snapshot are kept and `submit`
-// can be run again safely.
+// Key/snapshot lifetime is the heart of this function. The key is cleared
+// only when non-creation is actually *established*: a service validation
+// rejection — a 4xx in which the service judged the request's contents and
+// refused them, which it does before storing anything. That is narrower
+// than "any 4xx": it excludes 409 (the key demonstrably *is* used) and the
+// delivery failures 408/425, which report that the request did not arrive
+// usably and say nothing about whether the order was stored.
+//
+// Everything else is ambiguous — timeouts, body-read errors, connection
+// resets, 5xx from an intermediary, and any 2xx other than 200/201 — so
+// the key and the submitted snapshot are kept and `submit` can be run
+// again safely.
 func (s *session) submit() {
 	// If an earlier attempt left an unresolved outcome, resend exactly the
 	// same contents under the same key. Rebuilding the body from the
@@ -664,9 +683,31 @@ func (s *session) submit() {
 		fmt.Fprintln(s.out, "Use 'status <order-id>' with the ID above to see that order.")
 		return
 	}
-	// Any other 4xx means the service validated and refused the order
-	// before storing anything; that is the one case where we know no
-	// order exists, so the key can be released and editing resumed.
+	// Not every 4xx proves non-creation. A 408 (or 425) reports that the
+	// *request* timed out or arrived too early, which says nothing about
+	// whether the service had already stored the order — a proxy can emit
+	// 408 after the origin accepted it. Treating these as definite
+	// rejections and releasing the key is exactly how a retry creates a
+	// duplicate, so they are classified as ambiguous instead.
+	if ambiguousRequestFailure(status) {
+		fmt.Fprintf(s.out, "The service returned HTTP %d: %s\n", status, resp.errorMessage(status))
+		s.reportUnresolved()
+		return
+	}
+	// What remains is a service *validation* rejection: the service read
+	// the request, judged its contents, and refused it before storing
+	// anything. That is the one case where non-creation is established,
+	// so the key can be released and editing resumed. This is narrower
+	// than "any 4xx": the delivery failures (408/425) and the key
+	// conflict (409) are handled above precisely because they are not
+	// judgements about the contents.
+	//
+	// The honest residual limit: a 4xx synthesized by an intermediary
+	// that is neither 408 nor 425 (say a proxy's own 403 or 404) is
+	// indistinguishable on the wire from the service's own rejection, so
+	// it is treated as one. Narrowing further would need a signal the
+	// service controls — an error envelope the builder can authenticate —
+	// which is out of scope here and noted in the README.
 	if status >= 400 && status < 500 {
 		fmt.Fprintf(s.out, "The service rejected the order: %s\n", resp.errorMessage(status))
 		fmt.Fprintln(s.out, "No order was created, so you can fix the problem and submit again.")
@@ -678,6 +719,19 @@ func (s *session) submit() {
 	// ambiguous: upstream may have created the order before the failure.
 	if status >= 300 {
 		fmt.Fprintf(s.out, "The service returned an error: %s\n", resp.errorMessage(status))
+		s.reportUnresolved()
+		return
+	}
+	// Only 200 (idempotent replay) and 201 (created) are defined outcomes
+	// for a submission. Any other 2xx — 202 Accepted, 204 No Content, a
+	// 206 from a confused intermediary — does not establish that the order
+	// exists in a final state, so it must not be announced as completion.
+	// 202 in particular means "queued, not yet processed".
+	if status != http.StatusOK && status != http.StatusCreated {
+		fmt.Fprintf(s.out, "The service replied HTTP %d, which this client does not treat as a completed submission.\n", status)
+		if status == http.StatusAccepted {
+			fmt.Fprintln(s.out, "HTTP 202 means the request was accepted for processing but not necessarily stored yet.")
+		}
 		s.reportUnresolved()
 		return
 	}
@@ -746,20 +800,45 @@ func (s *session) update() {
 	in := s.input()
 	status, resp, err := s.client.call(http.MethodPatch, "/orders/"+s.orderID, &in, "")
 	if err != nil {
+		// An update is a wholesale replacement of items, tip, and promo,
+		// so it is naturally idempotent: applying the same body twice
+		// leaves the same order. Retrying is therefore safe and needs no
+		// idempotency key — unlike submit, a repeat cannot duplicate
+		// anything. The only thing unknown is whether it landed yet.
 		fmt.Fprintf(s.out, "The update did not complete: %v\n", err)
-		fmt.Fprintf(s.out, "It may or may not have been applied — run 'status' to see the order's current contents before retrying.\n")
+		fmt.Fprintln(s.out, "It may or may not have been applied. Running 'update' again is safe — it replaces the whole order, so applying it twice is the same as once.")
+		s.explainStatusIsNotAContentsCheck()
 		return
 	}
 	if status >= 300 {
 		fmt.Fprintf(s.out, "The service rejected the update: %s\n", resp.errorMessage(status))
+		if status == http.StatusConflict {
+			// The kitchen has moved on; no retry will help.
+			fmt.Fprintln(s.out, "The order can no longer be changed, so retrying will not help. Run 'status' to see where it is.")
+		} else if status >= 500 || ambiguousRequestFailure(status) {
+			fmt.Fprintln(s.out, "Running 'update' again is safe if you want to retry.")
+		}
 		return
 	}
 	if err := resp.validateOrder(); err != nil {
 		fmt.Fprintf(s.out, "The service replied HTTP %d but %v.\n", status, err)
-		fmt.Fprintln(s.out, "Run 'status' to see the order's current contents.")
+		fmt.Fprintln(s.out, "The update may still have been applied. Running 'update' again is safe — it replaces the whole order.")
+		s.explainStatusIsNotAContentsCheck()
 		return
 	}
 	fmt.Fprintf(s.out, "Order %s updated. New total: %s.\n", resp.ID, resp.TotalFormatted)
+}
+
+// explainStatusIsNotAContentsCheck states exactly what `status` can and
+// cannot settle after an uncertain update. `status` prints the order's ID,
+// lifecycle status, and charged total only — it does not list items,
+// toppings, tip, or promo — so it cannot confirm *which* contents the
+// service holds. Two different orders can share a total, and the surest
+// recovery is to resend the same update rather than to infer from a figure.
+func (s *session) explainStatusIsNotAContentsCheck() {
+	fmt.Fprintln(s.out, "'status' reports only the order's lifecycle status and charged total, not its items, tip, or promo,")
+	fmt.Fprintln(s.out, "so a matching total is not proof the update landed. To read the stored contents directly:")
+	fmt.Fprintf(s.out, "  GET %s/orders/%s\n", s.client.base, s.orderID)
 }
 
 func (s *session) cancel(args []string) {

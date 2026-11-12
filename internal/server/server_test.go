@@ -427,6 +427,127 @@ func TestBodySizeLimit(t *testing.T) {
 	}
 }
 
+// The remaining tip combinations the earlier test did not reach, so that
+// every mode/field pairing has a declared outcome.
+func TestTipModeValidationRemainingCases(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		tip  string
+		want int
+	}{
+		// Rejected contradictions.
+		{"none with percent", `{"mode":"","percent":10}`, http.StatusBadRequest},
+		{"none with both", `{"mode":"","amount_cents":300,"percent":10}`, http.StatusBadRequest},
+		{"percent with amount", `{"mode":"percent","percent":10,"amount_cents":300}`, http.StatusBadRequest},
+		{"unknown mode", `{"mode":"gratuity","amount_cents":300}`, http.StatusBadRequest},
+		// Rejected out-of-range values in the *active* field.
+		{"negative amount", `{"mode":"amount","amount_cents":-100}`, http.StatusBadRequest},
+		{"negative percent", `{"mode":"percent","percent":-5}`, http.StatusBadRequest},
+		{"percent over 100", `{"mode":"percent","percent":101}`, http.StatusBadRequest},
+		// Rejected *negative* values in an inactive field. A sign check
+		// alone would let these through: they are refused because the
+		// inactive field must be exactly zero, not merely non-positive.
+		{"none with negative amount", `{"mode":"","amount_cents":-100}`, http.StatusBadRequest},
+		{"none with negative percent", `{"mode":"","percent":-5}`, http.StatusBadRequest},
+		{"amount with negative percent", `{"mode":"amount","amount_cents":300,"percent":-5}`, http.StatusBadRequest},
+		{"percent with negative amount", `{"mode":"percent","percent":10,"amount_cents":-100}`, http.StatusBadRequest},
+		// Percentage mode with an explicitly zero (inactive) amount is
+		// consistent and must still be accepted.
+		{"percent with zero amount", `{"mode":"percent","percent":15,"amount_cents":0}`, http.StatusCreated},
+		{"amount with zero percent", `{"mode":"amount","amount_cents":250,"percent":0}`, http.StatusCreated},
+		{"none with both zero", `{"mode":"","amount_cents":0,"percent":0}`, http.StatusCreated},
+		// Accepted: consistent, in-range, including the boundaries.
+		{"omitted tip", ``, http.StatusCreated},
+		{"explicit none", `{"mode":""}`, http.StatusCreated},
+		{"zero amount", `{"mode":"amount","amount_cents":0}`, http.StatusCreated},
+		{"zero percent", `{"mode":"percent","percent":0}`, http.StatusCreated},
+		{"percent at 100", `{"mode":"percent","percent":100}`, http.StatusCreated},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			srv, st := testServer(t)
+			body := `{"items":[{"size":"Small","quantity":1}]`
+			if tt.tip != "" {
+				body += `,"tip":` + tt.tip
+			}
+			body += `}`
+
+			status, resp := postRaw(t, srv.URL+"/orders", body)
+			if status != tt.want {
+				t.Errorf("status = %d, want %d. body: %s", status, tt.want, resp)
+			}
+			wantStored := 0
+			if tt.want == http.StatusCreated {
+				wantStored = 1
+			}
+			if st.Count() != wantStored {
+				t.Errorf("store holds %d orders, want %d", st.Count(), wantStored)
+			}
+		})
+	}
+}
+
+// GET /orders/{id} across every lifecycle status, so status reporting is
+// exercised beyond the Not Started case.
+func TestGetOrderReportsEveryStatus(t *testing.T) {
+	srv, _ := testServer(t)
+
+	t.Run("advancing statuses", func(t *testing.T) {
+		_, v := post(t, srv.URL+"/orders", "", sampleInput())
+		for _, want := range []order.Status{
+			order.StatusNotStarted,
+			order.StatusStarted,
+			order.StatusReadyForPickup,
+			order.StatusDelivered,
+		} {
+			resp, err := http.Get(srv.URL + "/orders/" + v.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got orderView
+			_ = json.NewDecoder(resp.Body).Decode(&got)
+			resp.Body.Close()
+			if got.Status != want {
+				t.Errorf("status = %q, want %q", got.Status, want)
+			}
+			if got.TotalFormatted == "" {
+				t.Error("total_formatted missing from the reply")
+			}
+			if want == order.StatusDelivered {
+				break
+			}
+			adv, _ := http.Post(srv.URL+"/orders/"+v.ID+"/advance", "", nil)
+			adv.Body.Close()
+		}
+		// Advancing a Delivered order is a conflict, not a silent no-op.
+		adv, _ := http.Post(srv.URL+"/orders/"+v.ID+"/advance", "", nil)
+		adv.Body.Close()
+		if adv.StatusCode != http.StatusConflict {
+			t.Errorf("advancing Delivered = %d, want 409", adv.StatusCode)
+		}
+	})
+
+	t.Run("cancelled", func(t *testing.T) {
+		_, v := post(t, srv.URL+"/orders", "", sampleInput())
+		c, _ := http.Post(srv.URL+"/orders/"+v.ID+"/cancel", "", nil)
+		c.Body.Close()
+
+		resp, err := http.Get(srv.URL + "/orders/" + v.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got orderView
+		_ = json.NewDecoder(resp.Body).Decode(&got)
+		resp.Body.Close()
+		if got.Status != order.StatusCancelled {
+			t.Errorf("status = %q, want %q", got.Status, order.StatusCancelled)
+		}
+		// A cancelled order still reports the total it would have charged.
+		if got.TotalFormatted == "" {
+			t.Error("total_formatted missing for a cancelled order")
+		}
+	})
+}
+
 func TestTipModeValidation(t *testing.T) {
 	srv, st := testServer(t)
 	before := st.Count()

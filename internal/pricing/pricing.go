@@ -24,13 +24,28 @@ import (
 // Formatting to dollars happens only at display time, via String.
 type Cents int64
 
-// MaxQuantity is the largest quantity accepted for a single line item.
-// Quantities above this risk integer overflow in the pricing arithmetic.
-const MaxQuantity = 1_000_000
+// The system's declared numeric limits.
+//
+// These are a deliberate domain bound, not an artifact of int64. Every
+// monetary value this package accepts or produces — line totals, subtotal,
+// discount, taxable, tax, tip, and total — is in [0, MaxCents], and every
+// line item quantity is in [1, MaxQuantity]. Inputs outside those ranges
+// are rejected with an error rather than being clamped or wrapped.
+//
+// The bounds are chosen so the intermediate arithmetic cannot overflow:
+// the largest reachable line total is MaxQuantity × (Large base + every
+// topping), which is far below MaxCents, and MaxCents itself is ~9×10^7
+// times smaller than MaxInt64, leaving ample headroom for the subtotal,
+// tax, and tip steps. The safe* helpers below still check int64 overflow
+// as a backstop, so a future menu or limit change cannot silently wrap.
+const (
+	// MaxQuantity is the largest quantity accepted for a single line item.
+	MaxQuantity = 1_000_000
 
-// MaxCents is the largest monetary value the system will accept or compute.
-// This protects against integer overflow in monetary arithmetic.
-const MaxCents Cents = 1_000_000_000_00 // $1,000,000,000.00 in cents
+	// MaxCents is the largest monetary value the system accepts or
+	// computes: $1,000,000,000.00.
+	MaxCents Cents = 1_000_000_000_00
+)
 
 // String formats the amount as dollars and whole cents, e.g. $12.34.
 func (c Cents) String() string {
@@ -47,7 +62,9 @@ func (c Cents) String() string {
 	return fmt.Sprintf("%s$%d.%02d", sign, v/100, v%100)
 }
 
-// safeAdd returns a + b, checking for signed integer overflow.
+// safeAdd returns a + b, or an error if the result would overflow int64.
+// It is total: every pair of inputs either yields the exact sum or an
+// error, for negative operands as well as positive ones.
 func safeAdd(a, b Cents) (Cents, error) {
 	if b > 0 && a > math.MaxInt64-b {
 		return 0, fmt.Errorf("arithmetic overflow adding %s and %s", a, b)
@@ -58,8 +75,17 @@ func safeAdd(a, b Cents) (Cents, error) {
 	return a + b, nil
 }
 
-// safeMul returns a * b where b is a non-negative int64 multiplier,
-// checking for signed integer overflow.
+// safeMul returns a × b, or an error if b is negative or the result would
+// overflow int64.
+//
+// Contract notes, because both are easy to get wrong:
+//   - b must be non-negative. This is checked *before* any short-circuit,
+//     so safeMul(0, -1) is an error rather than a silent 0; callers use the
+//     error to reject bad input, and swallowing it for a == 0 would make
+//     the check depend on unrelated data.
+//   - a may be negative. The magnitude comparison uses the absolute value
+//     of a, so a negative a is bounded correctly instead of comparing
+//     against a negative quotient (which would accept every b).
 func safeMul(a Cents, b int64) (Cents, error) {
 	if b < 0 {
 		return 0, fmt.Errorf("negative multiplier %d", b)
@@ -67,29 +93,58 @@ func safeMul(a Cents, b int64) (Cents, error) {
 	if a == 0 || b == 0 {
 		return 0, nil
 	}
-	if b > math.MaxInt64/int64(a) {
+	mag := int64(a)
+	if mag < 0 {
+		mag = -mag // a == MinInt64 cannot occur: callers bound a by MaxCents
+	}
+	if b > math.MaxInt64/mag {
 		return 0, fmt.Errorf("arithmetic overflow multiplying %s by %d", a, b)
 	}
 	return a * Cents(b), nil
 }
 
 // percentOf returns num/den of c, rounded half up to the nearest cent.
-// Every amount in this system is non-negative (discounts are floored at the
-// subtotal), so adding den/2 before integer division implements
-// round-half-up exactly, with no floating point involved. This is the ONLY
-// rounding rule in the system, and it is applied in exactly three places:
-// percentage promo discounts, tax, and percentage tips.
+// Adding den/2 before integer division implements round-half-up exactly,
+// with no floating point involved. This is the ONLY rounding rule in the
+// system, and it is applied in exactly three places: percentage promo
+// discounts, tax, and percentage tips.
+//
+// Domain: c must be non-negative. Every amount this is applied to is
+// non-negative (discounts are floored at the subtotal), and the `+ den/2`
+// trick only rounds half *up* for non-negative values — for a negative c
+// it rounds half toward zero instead. Callers must not pass a negative c;
+// safePercentOf enforces that rather than silently returning a value
+// rounded by a different rule.
 func percentOf(c Cents, num, den int64) Cents {
 	return Cents((int64(c)*num + den/2) / den)
 }
 
-// safePercentOf is like percentOf but checks for overflow in the multiplication.
+// safePercentOf is percentOf with an overflow check on the intermediate
+// multiplication, which is the only step that can exceed int64.
+//
+// Contract: c must be non-negative, den must be positive, and num must be
+// non-negative. All three are rejected with an error rather than assumed,
+// because percentOf's round-half-up rule only holds for a non-negative c
+// (see percentOf) — returning a differently-rounded figure would be worse
+// than refusing. The overflow check accounts for the `+ den/2` rounding
+// term percentOf adds before dividing; without it, a value just under the
+// multiplication limit could still overflow during rounding.
 func safePercentOf(c Cents, num, den int64) (Cents, error) {
-	if int64(c) > 0 && num > 0 && num > math.MaxInt64/int64(c) {
-		return 0, fmt.Errorf("arithmetic overflow computing percentage of %s", c)
+	if c < 0 {
+		return 0, fmt.Errorf("percentage of a negative amount (%s) is not supported", c)
 	}
-	if int64(c) < 0 && num > 0 && num > math.MaxInt64/-int64(c) {
-		return 0, fmt.Errorf("arithmetic overflow computing percentage of %s", c)
+	if den <= 0 {
+		return 0, fmt.Errorf("invalid denominator %d", den)
+	}
+	if num < 0 {
+		return 0, fmt.Errorf("negative rate %d", num)
+	}
+	if c == 0 || num == 0 {
+		return 0, nil
+	}
+	// Require c*num + den/2 <= MaxInt64, matching percentOf's arithmetic.
+	if num > (math.MaxInt64-den/2)/int64(c) {
+		return 0, fmt.Errorf("arithmetic overflow computing %d/%d of %s", num, den, c)
 	}
 	return percentOf(c, num, den), nil
 }
@@ -517,13 +572,15 @@ func Price(items []LineItem, tip Tip, promoCode string) (Totals, error) {
 	if err != nil {
 		return Totals{}, err
 	}
-	total, err := safeAdd(taxable, tax)
+	total, err := safeAdd(bill, tipAmt)
 	if err != nil {
 		return Totals{}, err
 	}
-	total, err = safeAdd(total, tipAmt)
-	if err != nil {
-		return Totals{}, err
+	// MaxCents bounds the amount actually charged, not just the subtotal.
+	// A subtotal under the limit can still produce a total above it once
+	// tax and a dollar tip are added, so the final figure is checked too.
+	if total > MaxCents {
+		return Totals{}, fmt.Errorf("order total %s exceeds the maximum of %s", total, MaxCents)
 	}
 	return Totals{
 		Subtotal: subtotal,
