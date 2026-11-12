@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 
@@ -53,6 +54,54 @@ func TestCreateWithoutKeyAlwaysCreates(t *testing.T) {
 	}
 }
 
+func TestIdempotentCreateDifferentBodyRejected(t *testing.T) {
+	s := New()
+	in1 := smallOrder()
+	o, created, err := s.Create(in1, "key-123")
+	if err != nil {
+		t.Fatalf("first Create: %v", err)
+	}
+	if !created {
+		t.Fatal("expected created == true")
+	}
+
+	// Same key, different contents: should be rejected.
+	in2 := order.Input{Items: []pricing.LineItem{{Size: "Large", Quantity: 1}}}
+	_, created, err = s.Create(in2, "key-123")
+	if err == nil {
+		t.Fatal("expected error for different body with same key")
+	}
+	if created {
+		t.Fatal("created should be false for rejected replay")
+	}
+	if !strings.Contains(err.Error(), o.ID) {
+		t.Errorf("error should mention the original order ID %q, got %v", o.ID, err)
+	}
+	if s.Count() != 1 {
+		t.Errorf("store holds %d orders, want 1", s.Count())
+	}
+}
+
+func TestInputsEqual(t *testing.T) {
+	in := smallOrder()
+	o := &order.Order{
+		Items:     []pricing.LineItem{{Size: "Small", Quantity: 1}},
+		PromoCode: "",
+	}
+	if !inputsEqual(in, o) {
+		t.Error("identical inputs should be equal")
+	}
+	// Different items.
+	in2 := order.Input{Items: []pricing.LineItem{{Size: "Large", Quantity: 1}}}
+	if inputsEqual(in2, o) {
+		t.Error("different items should not be equal")
+	}
+	// Different promo.
+	o.PromoCode = "SAVE5"
+	if inputsEqual(in, o) {
+		t.Error("different promo should not be equal")
+	}
+}
 func TestCreateRejectsInvalidOrder(t *testing.T) {
 	s := New()
 	_, _, err := s.Create(order.Input{Items: []pricing.LineItem{{Size: "Huge", Quantity: 1}}}, "k")

@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"pizzabuilder/internal/order"
 	"pizzabuilder/internal/pricing"
 )
 
@@ -216,6 +217,62 @@ func TestDispatchControlCommands(t *testing.T) {
 			}
 			if got := out.String(); (tt.message == "" && got != "") || !strings.Contains(got, tt.message) {
 				t.Errorf("output = %q, want %q", got, tt.message)
+			}
+		})
+	}
+}
+func TestHasPending(t *testing.T) {
+	tests := []struct {
+		name       string
+		idemKey    string
+		orderID    string
+		pendingIn  *order.Input
+		wantPending bool
+	}{
+		{"no submission", "", "", nil, false},
+		{"successful submit - has orderID", "key-1", "ord-1", nil, false},
+		{"pending after timeout", "key-2", "", &order.Input{}, true},
+		{"no key", "", "", &order.Input{}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &session{
+				idemKey:      tt.idemKey,
+				orderID:      tt.orderID,
+				pendingInput: tt.pendingIn,
+			}
+			if got := s.hasPending(); got != tt.wantPending {
+				t.Errorf("hasPending() = %v, want %v", got, tt.wantPending)
+			}
+		})
+	}
+}
+
+// TestEditsBlockedWhilePending verifies that editing commands are rejected
+// when a submission is unresolved.
+func TestEditsBlockedWhilePending(t *testing.T) {
+	var out bytes.Buffer
+	s := &session{
+		out:          &out,
+		idemKey:      "key-pending",
+		pendingInput: &order.Input{Items: []pricing.LineItem{{Size: "Small", Quantity: 1}}},
+	}
+	blocked := []string{
+		"add small 1",
+		"remove 1",
+		"setqty 1 2",
+		"settoppings 1 bacon",
+		"tip amount 3.00",
+		"promo SAVE5",
+	}
+	for _, cmd := range blocked {
+		t.Run(cmd, func(t *testing.T) {
+			out.Reset()
+			if s.dispatch(cmd) {
+				t.Fatal("command requested exit")
+			}
+			if !strings.Contains(out.String(), "previous submission") {
+				t.Errorf("expected 'previous submission' message, got %q", out.String())
 			}
 		})
 	}

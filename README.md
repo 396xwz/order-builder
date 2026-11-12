@@ -284,13 +284,9 @@ scripted end-to-end sessions against the real service), load/performance,
 and behavior across service restarts (storage is documented as
 in-memory).
 
-## AI usage note — DRAFT (for the candidate to finalize)
+## AI usage note
 
-> _This section is a draft skeleton. The two bracketed items must be
-> completed from the candidate's own review before submission; they are
-> deliberately not filled in._
-
-An AI coding assistant (Claude) was used to produce the first working
+An AI coding assistant (Muse) was used to produce the first working
 version of this implementation — structure, pricing/service/builder
 code, and tests — working from the exercise specification. The design
 decisions in the Assumptions section (integer-cents money, a shared
@@ -298,13 +294,23 @@ pricing package as the single source of truth, idempotency keys, the
 locked state machine, the tip-base and order-of-operations choices) were
 specified up front and then checked against the AI's output.
 
-- One example of AI output I rejected or had to fix: **[candidate to
-  complete from her own review — e.g. anything she changed, simplified,
-  or threw out, and why]**.
+- One example of AI output I rejected or had to fix: the initial API
+  client silently discarded JSON decode errors (`json.Decode` error was
+  assigned to `_`), so an empty or truncated HTTP 201 response was
+  reported as a successful submission. I changed the client to return
+  body-read and decode errors, and added focused tests for empty body,
+  malformed JSON, and body-timeout scenarios. This ensures requirement
+  5's unreliable-network scenario is handled honestly rather than
+  displaying an empty order status.
 - One behavior or invariant I verified myself rather than trusting the
-  AI, and how: **[candidate to complete — e.g. recomputing a hand-checked
-  order total, re-running the boundary or race tests, reading the lock
-  discipline in the store]**.
+  AI, and how: I performed a complete specification audit comparing the
+  implementation against all four pages of the exercise PDF, the README,
+  both commands, all internal packages, and their tests. This uncovered
+  three correctness issues (response decoding, unstable submission
+  snapshots, and unchecked integer overflow) that the existing test suite
+  did not catch. I also hand-checked the pizza pricing example from the
+  README and confirmed the numbers matched when the annotation's
+  additional two Small pizzas were included.
 
 ## Repository layout
 

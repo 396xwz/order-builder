@@ -15,6 +15,7 @@ package store
 import (
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -69,7 +70,11 @@ func (s *Store) Create(in order.Input, idemKey string) (o *order.Order, created 
 
 	if idemKey != "" {
 		if id, ok := s.byIdem[idemKey]; ok {
-			return s.orders[id].Clone(), false, nil
+			existing := s.orders[id]
+			if !inputsEqual(in, existing) {
+				return nil, false, fmt.Errorf("idempotency key %q already used for order %q with different contents; use PATCH /orders/%s to update", idemKey, id, id)
+			}
+			return existing.Clone(), false, nil
 		}
 	}
 	totals, err := pricing.Price(in.Items, in.Tip, in.PromoCode)
@@ -211,4 +216,19 @@ func cloneItems(items []pricing.LineItem) []pricing.LineItem {
 		}
 	}
 	return out
+}
+
+// inputsEqual reports whether the given input matches the order's current
+// items, tip, and promo code. Used to detect same-key/different-body misuse.
+func inputsEqual(in order.Input, o *order.Order) bool {
+	if !reflect.DeepEqual(in.Items, o.Items) {
+		return false
+	}
+	if in.Tip != o.Tip {
+		return false
+	}
+	if canonicalPromo(in.PromoCode) != o.PromoCode {
+		return false
+	}
+	return true
 }

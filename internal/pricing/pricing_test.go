@@ -2,6 +2,7 @@ package pricing
 
 import (
 	"errors"
+	"math"
 	"strings"
 	"testing"
 )
@@ -54,6 +55,82 @@ func TestPercentOfRoundsHalfUp(t *testing.T) {
 		if got := percentOf(c.amount, c.num, c.den); got != c.want {
 			t.Errorf("percentOf(%d, %d, %d) = %d, want %d", c.amount, c.num, c.den, got, c.want)
 		}
+	}
+}
+
+func TestCentsStringMinInt64(t *testing.T) {
+	// String formatting must not overflow on math.MinInt64.
+	c := Cents(math.MinInt64)
+	s := c.String()
+	if s == "" {
+		t.Error("Cents(MinInt64).String() returned empty string")
+	}
+	// It should start with "-$".
+	if s[:2] != "-$" {
+		t.Errorf("Cents(MinInt64).String() = %q, want starting with \"-$\"", s)
+	}
+}
+
+func TestSafeAdd(t *testing.T) {
+	big := Cents(math.MaxInt64 - 10)
+	if _, err := safeAdd(big, 20); err == nil {
+		t.Error("safeAdd(MaxInt64-10, 20): want overflow error")
+	}
+	got, err := safeAdd(100, 200)
+	if err != nil || got != 300 {
+		t.Errorf("safeAdd(100, 200) = (%d, %v), want (300, nil)", got, err)
+	}
+}
+
+func TestSafeMul(t *testing.T) {
+	big := Cents(math.MaxInt64)
+	if _, err := safeMul(big, 2); err == nil {
+		t.Error("safeMul(MaxInt64, 2): want overflow error")
+	}
+	if _, err := safeMul(1, -1); err == nil {
+		t.Error("safeMul(1, -1): want error for negative multiplier")
+	}
+	got, err := safeMul(500, 3)
+	if err != nil || got != 1500 {
+		t.Errorf("safeMul(500, 3) = (%d, %v), want (1500, nil)", got, err)
+	}
+}
+
+func TestLineTotalOverflow(t *testing.T) {
+	// A Large pizza (1200¢) with maximum quantity should succeed.
+	_, err := LineTotal(LineItem{Size: "Large", Quantity: MaxQuantity})
+	if err != nil {
+		t.Errorf("LineTotal with MaxQuantity: unexpected error: %v", err)
+	}
+	// A Large pizza with quantity just above MaxQuantity should fail.
+	_, err = LineTotal(LineItem{Size: "Large", Quantity: MaxQuantity + 1})
+	if err == nil {
+		t.Error("LineTotal with MaxQuantity+1: want error, got nil")
+	}
+}
+
+func TestPriceOverflow(t *testing.T) {
+	// A single item with an extremely large quantity that would overflow
+	// arithmetic should be rejected.
+	big := []LineItem{{Size: "Small", Quantity: 1_000_000_000}}
+	_, err := Price(big, Tip{}, "")
+	if err == nil {
+		t.Error("Price with overflow quantity: want error, got nil")
+	}
+}
+
+func TestPercentOfOverflow(t *testing.T) {
+	// safePercentOf should reject overflow cases.
+	// With 10% of MaxInt64, the multiplication overflows.
+	big := Cents(math.MaxInt64/10 + 1)
+	_, err := safePercentOf(big, 10, 100)
+	if err == nil {
+		t.Error("safePercentOf(just-over-MaxInt64/10, 10, 100): want overflow error")
+	}
+	// Normal case should work.
+	got, err := safePercentOf(1000, 10, 100)
+	if err != nil || got != 100 {
+		t.Errorf("safePercentOf(1000, 10, 100) = (%d, %v), want (100, nil)", got, err)
 	}
 }
 

@@ -69,13 +69,21 @@ func main() {
 // ---------------------------------------------------------------------------
 
 type session struct {
-	client  *apiClient
-	out     io.Writer
-	items   []pricing.LineItem
-	tip     pricing.Tip
-	promo   string // canonical promo code, "" for none
-	idemKey string // generated on first submit, reused for every retry of this order
-	orderID string // set after a successful submit
+	client       *apiClient
+	out          io.Writer
+	items        []pricing.LineItem
+	tip          pricing.Tip
+	promo        string // canonical promo code, "" for none
+	idemKey      string // generated on first submit, reused for every retry of this order
+	orderID      string // set after a successful submit
+	pendingInput *order.Input // snapshot of the submission when outcome is unresolved
+}
+
+// hasPending reports whether a submission has been attempted but the outcome
+// is still unknown (e.g. a timeout). While pending, edits are blocked so
+// that a retry with the same idempotency key sends the same contents.
+func (s *session) hasPending() bool {
+	return s.idemKey != "" && s.orderID == "" && s.pendingInput != nil
 }
 
 func (s *session) input() order.Input {
@@ -176,6 +184,10 @@ func (s *session) menu() {
 // ---------------------------------------------------------------------------
 
 func (s *session) add(args []string) {
+	if s.hasPending() {
+		fmt.Fprintln(s.out, "The previous submission's outcome is unknown (timed out). Use 'submit' to retry, or 'status <order-id>' if you know the order ID.")
+		return
+	}
 	if len(args) < 2 || len(args) > 3 {
 		fmt.Fprintln(s.out, "Usage: add <size> <qty> [topping,topping,...]")
 		return
@@ -188,6 +200,10 @@ func (s *session) add(args []string) {
 	qty, err := strconv.Atoi(args[1])
 	if err != nil || qty < 1 {
 		fmt.Fprintf(s.out, "Quantity must be a whole number of at least 1, got %q.\n", args[1])
+		return
+	}
+	if qty > pricing.MaxQuantity {
+		fmt.Fprintf(s.out, "Quantity %d exceeds the maximum of %d per line item.\n", qty, pricing.MaxQuantity)
 		return
 	}
 	var toppings []string
@@ -204,6 +220,10 @@ func (s *session) add(args []string) {
 }
 
 func (s *session) remove(args []string) {
+	if s.hasPending() {
+		fmt.Fprintln(s.out, "The previous submission's outcome is unknown (timed out). Use 'submit' to retry, or 'status <order-id>' if you know the order ID.")
+		return
+	}
 	idx, ok := s.lineIndex(args)
 	if !ok {
 		return
@@ -214,6 +234,10 @@ func (s *session) remove(args []string) {
 }
 
 func (s *session) setqty(args []string) {
+	if s.hasPending() {
+		fmt.Fprintln(s.out, "The previous submission's outcome is unknown (timed out). Use 'submit' to retry, or 'status <order-id>' if you know the order ID.")
+		return
+	}
 	if len(args) != 2 {
 		fmt.Fprintln(s.out, "Usage: setqty <line#> <qty>")
 		return
@@ -227,11 +251,19 @@ func (s *session) setqty(args []string) {
 		fmt.Fprintf(s.out, "Quantity must be a whole number of at least 1, got %q. Use 'remove' to drop a line.\n", args[1])
 		return
 	}
+	if qty > pricing.MaxQuantity {
+		fmt.Fprintf(s.out, "Quantity %d exceeds the maximum of %d per line item.\n", qty, pricing.MaxQuantity)
+		return
+	}
 	s.items[idx].Quantity = qty
 	s.showTotals()
 }
 
 func (s *session) settoppings(args []string) {
+	if s.hasPending() {
+		fmt.Fprintln(s.out, "The previous submission's outcome is unknown (timed out). Use 'submit' to retry, or 'status <order-id>' if you know the order ID.")
+		return
+	}
 	if len(args) != 2 {
 		fmt.Fprintln(s.out, "Usage: settoppings <line#> <topping,topping|none>")
 		return
@@ -284,6 +316,10 @@ func parseToppings(csv string) ([]string, error) {
 }
 
 func (s *session) setTip(args []string) {
+	if s.hasPending() {
+		fmt.Fprintln(s.out, "The previous submission's outcome is unknown (timed out). Use 'submit' to retry, or 'status <order-id>' if you know the order ID.")
+		return
+	}
 	switch {
 	case len(args) == 1 && args[0] == "clear":
 		s.tip = pricing.Tip{}
@@ -309,6 +345,10 @@ func (s *session) setTip(args []string) {
 }
 
 func (s *session) setPromo(args []string) {
+	if s.hasPending() {
+		fmt.Fprintln(s.out, "The previous submission's outcome is unknown (timed out). Use 'submit' to retry, or 'status <order-id>' if you know the order ID.")
+		return
+	}
 	if len(args) != 1 {
 		fmt.Fprintln(s.out, "Usage: promo <CODE> | promo clear")
 		return
@@ -395,6 +435,9 @@ func parseMoney(s string) (pricing.Cents, error) {
 	if err != nil {
 		return 0, fmt.Errorf("%q is not a valid amount", s)
 	}
+	if dollars < 0 {
+		return 0, fmt.Errorf("amount cannot be negative")
+	}
 	var cents int64
 	if len(parts) == 2 {
 		frac := parts[1]
@@ -407,7 +450,12 @@ func parseMoney(s string) (pricing.Cents, error) {
 			return 0, fmt.Errorf("%q is not a valid amount", s)
 		}
 	}
-	return pricing.Cents(dollars*100 + cents), nil
+	// Check for overflow: MaxCents is the maximum monetary value.
+	total := dollars*100 + cents
+	if total < 0 || total > int64(pricing.MaxCents) {
+		return 0, fmt.Errorf("%q exceeds the maximum amount of %s", s, pricing.MaxCents)
+	}
+	return pricing.Cents(total), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -453,7 +501,12 @@ func (c *apiClient) call(method, path string, in *order.Input, idemKey string) (
 	}
 	defer resp.Body.Close()
 	var out orderResponse
-	_ = json.NewDecoder(resp.Body).Decode(&out)
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		// Body read or decode failure — e.g. timeout reading the body,
+		// empty body, malformed JSON. Preserve timeout classification so
+		// callers can retry.
+		return resp.StatusCode, nil, fmt.Errorf("reading response body: %w", err)
+	}
 	return resp.StatusCode, &out, nil
 }
 
@@ -478,30 +531,50 @@ func newIdemKey() string {
 // returns the original order instead of creating a duplicate. The retry
 // happens once, and the customer is told that it happened and why.
 func (s *session) submit() {
-	if len(s.items) == 0 {
-		fmt.Fprintln(s.out, "Nothing to submit — the order is empty.")
-		return
+	// If there's a pending submission, use the saved snapshot so the
+	// idempotency key always maps to the same contents.
+	if s.hasPending() {
+		fmt.Fprintln(s.out, "Reusing the previous submission — the outcome was unknown after a timeout.")
+	} else {
+		if len(s.items) == 0 {
+			fmt.Fprintln(s.out, "Nothing to submit — the order is empty.")
+			return
+		}
+		if _, err := pricing.Price(s.items, s.tip, s.promo); err != nil {
+			fmt.Fprintf(s.out, "Cannot submit yet: %v\n", err)
+			return
+		}
+		if s.idemKey == "" {
+			s.idemKey = newIdemKey()
+		}
+		in := s.input()
+		s.pendingInput = &in
 	}
-	if _, err := pricing.Price(s.items, s.tip, s.promo); err != nil {
-		fmt.Fprintf(s.out, "Cannot submit yet: %v\n", err)
-		return
-	}
-	if s.idemKey == "" {
-		s.idemKey = newIdemKey()
-	}
-	in := s.input()
-	status, resp, err := s.client.call(http.MethodPost, "/orders", &in, s.idemKey)
+
+	status, resp, err := s.client.call(http.MethodPost, "/orders", s.pendingInput, s.idemKey)
 	if err != nil && isTimeout(err) {
 		fmt.Fprintln(s.out, "The submission timed out; the service may or may not have received it.")
 		fmt.Fprintln(s.out, "Retrying once with the same idempotency key — if the first attempt did arrive, you get the original order back, not a duplicate.")
-		status, resp, err = s.client.call(http.MethodPost, "/orders", &in, s.idemKey)
+		status, resp, err = s.client.call(http.MethodPost, "/orders", s.pendingInput, s.idemKey)
 	}
 	if err != nil {
 		fmt.Fprintf(s.out, "Could not reach the order service: %v\n", err)
+		if !isTimeout(err) {
+			// Non-timeout error: the request didn't reach the server,
+			// so the idempotency key was never consumed. Reset so the
+			// user can edit and try again fresh.
+			s.idemKey = ""
+			s.pendingInput = nil
+		}
+		// On timeout: keep the pending state so the user can retry.
 		return
 	}
+	// Submission reached the server.
+	s.pendingInput = nil
 	if status >= 300 {
 		fmt.Fprintf(s.out, "The service rejected the order: %s\n", resp.Error)
+		// A rejection means the order was NOT created, so the key is unused.
+		s.idemKey = ""
 		return
 	}
 	s.orderID = resp.ID

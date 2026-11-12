@@ -10,6 +10,7 @@ package pricing
 import (
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 )
 
@@ -23,6 +24,14 @@ import (
 // Formatting to dollars happens only at display time, via String.
 type Cents int64
 
+// MaxQuantity is the largest quantity accepted for a single line item.
+// Quantities above this risk integer overflow in the pricing arithmetic.
+const MaxQuantity = 1_000_000
+
+// MaxCents is the largest monetary value the system will accept or compute.
+// This protects against integer overflow in monetary arithmetic.
+const MaxCents Cents = 1_000_000_000_00 // $1,000,000,000.00 in cents
+
 // String formats the amount as dollars and whole cents, e.g. $12.34.
 func (c Cents) String() string {
 	v := int64(c)
@@ -31,7 +40,37 @@ func (c Cents) String() string {
 		sign = "-"
 		v = -v
 	}
+	// Handle MinInt64 edge case: -(-MinInt64) overflows int64.
+	if v == math.MinInt64 {
+		return sign + "$92233720368547758.08"
+	}
 	return fmt.Sprintf("%s$%d.%02d", sign, v/100, v%100)
+}
+
+// safeAdd returns a + b, checking for signed integer overflow.
+func safeAdd(a, b Cents) (Cents, error) {
+	if b > 0 && a > math.MaxInt64-b {
+		return 0, fmt.Errorf("arithmetic overflow adding %s and %s", a, b)
+	}
+	if b < 0 && a < math.MinInt64-b {
+		return 0, fmt.Errorf("arithmetic overflow adding %s and %s", a, b)
+	}
+	return a + b, nil
+}
+
+// safeMul returns a * b where b is a non-negative int64 multiplier,
+// checking for signed integer overflow.
+func safeMul(a Cents, b int64) (Cents, error) {
+	if b < 0 {
+		return 0, fmt.Errorf("negative multiplier %d", b)
+	}
+	if a == 0 || b == 0 {
+		return 0, nil
+	}
+	if b > math.MaxInt64/int64(a) {
+		return 0, fmt.Errorf("arithmetic overflow multiplying %s by %d", a, b)
+	}
+	return a * Cents(b), nil
 }
 
 // percentOf returns num/den of c, rounded half up to the nearest cent.
@@ -42,6 +81,17 @@ func (c Cents) String() string {
 // percentage promo discounts, tax, and percentage tips.
 func percentOf(c Cents, num, den int64) Cents {
 	return Cents((int64(c)*num + den/2) / den)
+}
+
+// safePercentOf is like percentOf but checks for overflow in the multiplication.
+func safePercentOf(c Cents, num, den int64) (Cents, error) {
+	if int64(c) > 0 && num > 0 && num > math.MaxInt64/int64(c) {
+		return 0, fmt.Errorf("arithmetic overflow computing percentage of %s", c)
+	}
+	if int64(c) < 0 && num > 0 && num > math.MaxInt64/-int64(c) {
+		return 0, fmt.Errorf("arithmetic overflow computing percentage of %s", c)
+	}
+	return percentOf(c, num, den), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -319,6 +369,9 @@ func LineTotal(item LineItem) (Cents, error) {
 	if item.Quantity < 1 {
 		return 0, fmt.Errorf("quantity for a %s line must be at least 1, got %d", size.Name, item.Quantity)
 	}
+	if item.Quantity > MaxQuantity {
+		return 0, fmt.Errorf("quantity %d exceeds maximum of %d per line item", item.Quantity, MaxQuantity)
+	}
 	perPizza := size.BasePrice
 	seen := map[string]bool{}
 	for _, name := range item.Toppings {
@@ -332,7 +385,7 @@ func LineTotal(item LineItem) (Cents, error) {
 		seen[t.Name] = true
 		perPizza += ToppingPrice(size, t)
 	}
-	return perPizza * Cents(item.Quantity), nil
+	return safeMul(perPizza, int64(item.Quantity))
 }
 
 func sizeNames() string {
@@ -369,12 +422,15 @@ func (t Tip) amount(bill Cents) (Cents, error) {
 		if t.Amount < 0 {
 			return 0, fmt.Errorf("tip amount cannot be negative")
 		}
+		if t.Amount > MaxCents {
+			return 0, fmt.Errorf("tip amount %s exceeds maximum of %s", t.Amount, MaxCents)
+		}
 		return t.Amount, nil
 	case TipPercent:
 		if t.Percent < 0 || t.Percent > 100 {
 			return 0, fmt.Errorf("tip percentage must be between 0 and 100, got %d", t.Percent)
 		}
-		return percentOf(bill, t.Percent, 100), nil
+		return safePercentOf(bill, t.Percent, 100)
 	}
 	return 0, fmt.Errorf("unknown tip mode %q", t.Mode)
 }
@@ -425,7 +481,13 @@ func Price(items []LineItem, tip Tip, promoCode string) (Totals, error) {
 		if err != nil {
 			return Totals{}, err
 		}
-		subtotal += lt
+		subtotal, err = safeAdd(subtotal, lt)
+		if err != nil {
+			return Totals{}, err
+		}
+	}
+	if subtotal > MaxCents {
+		return Totals{}, fmt.Errorf("subtotal %s exceeds maximum of %s", subtotal, MaxCents)
 	}
 
 	var discount Cents
@@ -443,8 +505,23 @@ func Price(items []LineItem, tip Tip, promoCode string) (Totals, error) {
 	}
 
 	taxable := subtotal - discount
-	tax := percentOf(taxable, taxNum, taxDen)
-	tipAmt, err := tip.amount(taxable + tax)
+	tax, err := safePercentOf(taxable, taxNum, taxDen)
+	if err != nil {
+		return Totals{}, err
+	}
+	bill, err := safeAdd(taxable, tax)
+	if err != nil {
+		return Totals{}, err
+	}
+	tipAmt, err := tip.amount(bill)
+	if err != nil {
+		return Totals{}, err
+	}
+	total, err := safeAdd(taxable, tax)
+	if err != nil {
+		return Totals{}, err
+	}
+	total, err = safeAdd(total, tipAmt)
 	if err != nil {
 		return Totals{}, err
 	}
@@ -454,7 +531,7 @@ func Price(items []LineItem, tip Tip, promoCode string) (Totals, error) {
 		Taxable:  taxable,
 		Tax:      tax,
 		Tip:      tipAmt,
-		Total:    taxable + tax + tipAmt,
+		Total:    total,
 	}, nil
 }
 
