@@ -479,7 +479,12 @@ Packages tested and what they cover:
 - Helper contracts, including the cases they are easy to get wrong:
   `safeMul` rejects a negative multiplier even when the other operand is
   zero (no short-circuit hiding bad input) and bounds a negative operand
-  by magnitude; `safePercentOf` rejects a non-positive denominator, a
+  against the negative limit `MinInt64/a` rather than by magnitude, so
+  the representable boundary products `MinInt64 × 1` and
+  `(MinInt64/2) × 2` are accepted while `MinInt64 × 2`,
+  `(MinInt64/2) × 3`, and `(MinInt64/2 - 1) × 2` are rejected; `a == -1`
+  is special-cased because `MinInt64 / -1` is the one int64 division that
+  overflows on its own. `safePercentOf` rejects a non-positive denominator, a
   negative rate, and a negative amount, and its overflow bound accounts
   for the rounding term `percentOf` adds before dividing.
 - Declared limits at their exact boundaries: quantity at `MaxQuantity`

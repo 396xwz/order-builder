@@ -83,9 +83,21 @@ func safeAdd(a, b Cents) (Cents, error) {
 //     so safeMul(0, -1) is an error rather than a silent 0; callers use the
 //     error to reject bad input, and swallowing it for a == 0 would make
 //     the check depend on unrelated data.
-//   - a may be negative. The magnitude comparison uses the absolute value
-//     of a, so a negative a is bounded correctly instead of comparing
-//     against a negative quotient (which would accept every b).
+//   - a may be negative, and the bound is taken against the limit that
+//     actually applies to the sign of a: MaxInt64/a for a positive a and
+//     MinInt64/a for a negative one. Comparing a negative a against
+//     MaxInt64/a would yield a negative quotient and accept every b;
+//     negating a into a magnitude would instead reject results that are
+//     perfectly representable, because the negative range extends one
+//     further than the positive one (MinInt64 × 1 and (MinInt64/2) × 2
+//     are exact, yet |MinInt64| is not an int64 at all). Both quotients
+//     truncate toward zero, so the accepted range never includes a
+//     product that would wrap.
+//
+// a == -1 is handled separately: the quotient MinInt64/-1 is the one
+// int64 division that itself overflows (Go defines it as MinInt64), so
+// computing the limit that way would reject every b. Negating a
+// non-negative b is always representable, so every b is in range.
 func safeMul(a Cents, b int64) (Cents, error) {
 	if b < 0 {
 		return 0, fmt.Errorf("negative multiplier %d", b)
@@ -93,11 +105,16 @@ func safeMul(a Cents, b int64) (Cents, error) {
 	if a == 0 || b == 0 {
 		return 0, nil
 	}
-	mag := int64(a)
-	if mag < 0 {
-		mag = -mag // a == MinInt64 cannot occur: callers bound a by MaxCents
+	limit := int64(math.MaxInt64)
+	switch {
+	case a == -1:
+		// Every non-negative b is in range; -1 × b == -b.
+	case a < 0:
+		limit = math.MinInt64 / int64(a)
+	default:
+		limit = math.MaxInt64 / int64(a)
 	}
-	if b > math.MaxInt64/mag {
+	if b > limit {
 		return 0, fmt.Errorf("arithmetic overflow multiplying %s by %d", a, b)
 	}
 	return a * Cents(b), nil

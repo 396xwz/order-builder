@@ -130,7 +130,7 @@ func TestSafeHelperContracts(t *testing.T) {
 		}
 	})
 
-	t.Run("safeMul bounds a negative a by magnitude", func(t *testing.T) {
+	t.Run("safeMul bounds a negative a against the negative limit", func(t *testing.T) {
 		// Comparing against MaxInt64/a with a negative a yields a negative
 		// quotient, which would accept every b and wrap.
 		if got, err := safeMul(Cents(math.MinInt64/2), 4); err == nil {
@@ -139,6 +139,44 @@ func TestSafeHelperContracts(t *testing.T) {
 		// A legal negative multiplication still works.
 		if got, err := safeMul(-100, 3); err != nil || got != -300 {
 			t.Errorf("safeMul(-100, 3) = (%d, %v), want (-300, nil)", got, err)
+		}
+
+		// The negative range extends one further than the positive one, so
+		// these products are exactly representable and must be accepted.
+		// Bounding by |a| would reject them (|MinInt64| is not an int64).
+		if got, err := safeMul(Cents(math.MinInt64), 1); err != nil || got != Cents(math.MinInt64) {
+			t.Errorf("safeMul(MinInt64, 1) = (%d, %v), want (%d, nil)", got, err, Cents(math.MinInt64))
+		}
+		if got, err := safeMul(Cents(math.MinInt64), 0); err != nil || got != 0 {
+			t.Errorf("safeMul(MinInt64, 0) = (%d, %v), want (0, nil)", got, err)
+		}
+		if got, err := safeMul(Cents(math.MinInt64/2), 2); err != nil || got != Cents(math.MinInt64) {
+			t.Errorf("safeMul(MinInt64/2, 2) = (%d, %v), want (%d, nil)", got, err, Cents(math.MinInt64))
+		}
+		// One step past each of those boundaries must still be rejected.
+		if got, err := safeMul(Cents(math.MinInt64), 2); err == nil {
+			t.Errorf("safeMul(MinInt64, 2) = (%d, nil), want an overflow error", got)
+		}
+		if got, err := safeMul(Cents(math.MinInt64/2), 3); err == nil {
+			t.Errorf("safeMul(MinInt64/2, 3) = (%d, nil), want an overflow error", got)
+		}
+		// The smallest value whose product with 2 wraps is MinInt64/2 - 1.
+		if got, err := safeMul(Cents(math.MinInt64/2-1), 2); err == nil {
+			t.Errorf("safeMul(MinInt64/2-1, 2) = (%d, nil), want an overflow error", got)
+		}
+		// a == -1 is the one case where computing the limit as
+		// MinInt64/a overflows the division itself (Go defines the result
+		// as MinInt64), which would reject every multiplier.
+		if got, err := safeMul(-1, 2); err != nil || got != -2 {
+			t.Errorf("safeMul(-1, 2) = (%d, %v), want (-2, nil)", got, err)
+		}
+		if got, err := safeMul(-1, math.MaxInt64); err != nil || got != Cents(-math.MaxInt64) {
+			t.Errorf("safeMul(-1, MaxInt64) = (%d, %v), want (%d, nil)", got, err, Cents(-math.MaxInt64))
+		}
+
+		// The positive boundary is unchanged: MaxInt64 × 1 is exact.
+		if got, err := safeMul(Cents(math.MaxInt64), 1); err != nil || got != Cents(math.MaxInt64) {
+			t.Errorf("safeMul(MaxInt64, 1) = (%d, %v), want (%d, nil)", got, err, Cents(math.MaxInt64))
 		}
 	})
 
