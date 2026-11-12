@@ -216,27 +216,9 @@ where it lives in the code:
 
 ### Money and the single source of truth for pricing
 
-Money is an integer number of cents (`pricing.Cents`) everywhere —
-never a float — and is formatted to dollars only when displayed. All
-pricing lives in one package, `internal/pricing`: the menu (sizes,
-topping categories, toppings) as data tables, promo codes as data records
-(see below), and a single `Price` function that computes the breakdown in
-the documented order of operations.
-
-There is exactly one rounding rule — round half up, applied in exactly
-three places (percentage discounts, tax, percentage tips) — implemented
-as integer arithmetic by adding `den/2` before dividing. That trick is
-only round-half-up for a **non-negative** amount; on a negative value it
-rounds half toward zero instead. Since every amount it is applied to is
-non-negative by construction, the helper rejects a negative input rather
-than quietly returning a figure rounded by a second, undocumented rule.
-
-Pricing runs in **both** processes, from the **same** package. The
-builder computes the running total locally so the customer sees it update
-on every edit with no network round-trips.
-
-`Price` computes, in this order (assumption 1, restated here so the
-design answer stands on its own):
+Money is integer cents (`pricing.Cents`) everywhere — never a float —
+formatted to dollars only for display. One package, `internal/pricing`,
+holds the menu and promos as data and a single `Price` (assumption 1):
 
 ```
 subtotal = Σ quantity × (base_price + Σ topping_rate × base_price)
@@ -247,66 +229,37 @@ tip      = dollar amount as given, or round_half_up(percent of taxable + tax)
 total    = taxable + tax + tip
 ```
 
-Every figure is bounded: a quantity in `[1, 1,000,000]` and every
-monetary figure in `[$0.00, $1,000,000,000.00]` (assumption 14), rejected
-rather than clamped or wrapped.
+One rounding rule — round half up, in three places (percentage discounts,
+tax, percentage tips) — via `den/2` before integer division. That is only
+round-half-up for a **non-negative** amount, so the helper rejects
+negatives rather than applying a second, undocumented rule. Quantities
+are bounded to `[1, 1,000,000]` and money to `[$0, $1,000,000,000]`,
+rejected not clamped (assumption 14).
 
-Requirement 2 — "the total the customer sees must match the total the
-restaurant charges" — holds as follows, stated precisely because a
-blanket claim would be too strong:
-
-- **Guaranteed by construction:** for identical contents, the two
-  processes cannot compute different totals. There is one `Price`
-  function and one menu table, so calculation drift is impossible by
-  design, not by keeping two implementations in sync.
-- **Enforced by the service:** the charged total is recomputed
-  server-side on every submission and update, from the stored contents.
-  No client-supplied total is ever trusted, because the request format
-  has nowhere to put one.
-- **Not proved by strict decoding.** Rejecting unknown fields, trailing
-  content, and non-integer money tokens stops a *malformed or silently
-  reinterpreted* request from being priced — `{"quantity":1.0000000001}`
-  is refused rather than rounded to 1 — but a valid shape is not evidence
-  that the body describes the draft the customer was looking at. A
-  well-formed request for the wrong pizza is still well-formed. What
-  actually ties the charge to the draft is narrower and mechanical: the
-  builder freezes the submitted contents in a snapshot and resends that
-  exact snapshot on every retry, refusing local edits until the outcome
-  is known, so one idempotency key can never come to mean two different
-  orders. Agreement on the *figure* then follows from the shared `Price`
-  function, not from validation.
-- **Depends on the reply being read correctly**, which response
-  validation enforces: a submission is only reported as complete when
-  the service returned 200/201 with a usable order body.
-- **Not claimed:** that the figure on screen after an *unresolved*
-  submission is the charged total. In that state the builder reports the
-  outcome as unknown and shows no charged total at all; `status` is what
-  confirms the authoritative figure.
-
-Tests cover both halves: an HTTP-level test asserts the service's totals
-equal the pricing package's cent for cent, and an end-to-end test drives
-the real builder through a fault-injecting proxy and then compares the
-total it displayed with the total the service actually stored.
+Both processes price from the **same** package, so the builder totals
+locally with no round-trip. Requirement 2 holds narrowly: identical
+contents cannot price differently (one `Price`, one menu), and the
+service recomputes the charge from stored contents, trusting no client
+total. Strict decoding does *not* prove it — a well-formed request for
+the wrong pizza is still well-formed; what ties charge to draft is that
+the builder freezes the submitted contents and resends that snapshot on
+retry, refusing edits until resolved. While unresolved, no charged total
+is claimed.
 
 ### Extensibility: menu and promos as data
 
-Adding a **size** is one row in the size table (name, base price). Adding
-a **topping** is one row (name, category). Adding a **topping category**
-is one row (name, percentage of base); toppings in it are priced
-automatically, because a topping's price is derived from its category's
-rate and the pizza's base price — no topping carries its own price, and
-no pricing code mentions any specific size, topping, or category.
+A **size** is one row (name, base price); a **topping** one row (name,
+category); a **topping category** one row (name, percentage of base),
+whose toppings then price automatically, since a topping's price derives
+from its category rate and the base price. No pricing code names a
+specific size, topping, or category.
 
-A **promo code** is a record: its kind (percent-off or fixed-amount-off
-the pre-tax subtotal), its parameters, an optional qualifying condition
-(a minimum pre-tax subtotal, strictly greater — SAVE5's "over $20"), and
-a list of codes it conflicts with. The engine interprets records
-generically: compute the discount if it qualifies, floor a fixed discount
-at the subtotal, and refuse conflicting combinations using the records'
-own conflict lists (validated for symmetry by a test). A new promo whose
-condition is a minimum subtotal and whose conflicts are named codes is a
-new record, not a new branch — for example "$8 off over $50, never with
-SAVE5":
+A **promo** is a record: kind (percent-off or fixed-off the pre-tax
+subtotal), parameters, an optional minimum pre-tax subtotal (strictly
+greater — SAVE5's "over $20"), and conflicting codes. The engine reads
+records generically: discount if qualified, floor a fixed discount at the
+subtotal, refuse conflicts from the records' own lists (symmetry tested).
+So "$8 off over $50, never with SAVE5" is a record, not a branch:
 
 ```go
 {
@@ -320,143 +273,84 @@ SAVE5":
 },
 ```
 
-That is one row in `promoList`; no pricing code changes, and the
-conflict-symmetry test requires the matching entry on `SAVE5`. The core
-pricing tests stay as they are — only the menu/promo regression tests
-grow a case for the new record.
+One row in `promoList`, no pricing algorithm changes required;
+configuration entries live in Go source, and the symmetry test requires
+the matching entry on `SAVE5`.
 
-The honest limits of this design, since "data-driven" is easy to
-overclaim:
-
-- **New discount *mechanisms* need code.** "Cheapest pizza free", a
-  category-specific discount, or a buy-one-get-one all require a new
-  `PromoKind` and a case in the discount function. Only percent-off and
-  fixed-amount-off the pre-tax subtotal are data today.
-- **New *condition types* need code.** The only qualifying condition is a
-  minimum pre-tax subtotal. A condition on item count, a specific size, a
-  date range, or a customer attribute is a new field and new evaluation
-  logic, not a new row.
-- **Exclusion is pairwise and total.** Conflicts are declared as symmetric
-  code lists and at most one promo applies per order. "Stacking up to two
-  promos" or "this promo stacks only with that one" is a different model
-  and would need a rework, not a record.
-- **Promo application order is not modelled**, because only one promo can
-  apply. Supporting several would force a decision about sequencing that
-  the current design deliberately does not make.
-
-Conditions and conflicts — the dimensions the promos in this spec
-actually vary along — are pure data.
+"Data-driven" is easy to overclaim, so: new *mechanisms* ("cheapest pizza
+free", BOGO) need a new `PromoKind` and a discount-function case; new
+*condition types* (item count, size, date range) need a new field and
+evaluation logic, minimum pre-tax subtotal being the only one; and
+exclusion is pairwise and total — at most one promo per order, so
+"stacks only with that one" is a different model and application order is
+unmodelled. Conditions and conflicts are pure data; mechanisms are not.
 
 ### Order lifecycle, retries, and races
 
 An order moves `Not Started → Started → Ready for Pickup → Delivered`,
 advanced only by the restaurant side; a customer can update or cancel it
-only in `Not Started`. Every mutation checks the current status and
-mutates while holding the store's single mutex, so each check-and-change
-is atomic.
+only in `Not Started`. Every mutation checks status and mutates while
+holding the store's single mutex, so each check-and-change is atomic.
 
-*Retry after a timeout.* The builder generates one idempotency key per
-order and sends it with the submission. If the request times out — the
-order may or may not have arrived — the builder retries once with the
-**same** key and tells the customer it is doing so. The service records
-key → order ID on first submission; the retry finds the key and returns
-the original order (HTTP 200 instead of 201) instead of creating a
-duplicate. Guarantee: at most one order created per key within the
-running service.
+*Retry after a timeout.* The builder sends one idempotency key per order.
+On a timeout — the order may or may not have arrived — it retries once
+with the **same** key, saying so. The service records key → order ID on
+first submission, so the retry returns the original order (200, not 201)
+rather than a duplicate: at most one order per key while the service
+runs.
 
-*Ambiguous outcomes.* The builder keeps the key and the exact submitted
-contents whenever it cannot prove the order was **not** created. In that
-state it refuses local edits (so the key never comes to mean two
-different orders), explains the situation, and `submit` resends the
-original snapshot under the original key.
-
-The key is released only for a response that *establishes* non-creation,
-which is narrower than "any 4xx":
+*Ambiguous outcomes.* Whenever it cannot prove the order was **not**
+created, the builder keeps the key and submitted contents, refuses local
+edits (so one key never means two orders), and `submit` resends that
+snapshot. The key is released only for a response that *establishes*
+non-creation — narrower than "any 4xx":
 
 | Response | Treated as | Why |
 | --- | --- | --- |
-| 201, 200 | Resolved | Created, or an idempotent replay. |
-| A service *validation* rejection (e.g. 400 on a bad promo) | Non-creation established | The service judges the contents before storing, so nothing exists. |
-| 409 | Key is in use | Proof the key *was* used; it is kept and the original order ID is reported. |
-| 408, 425 | Ambiguous | The request failed to arrive usably — a proxy can emit these after the origin stored the order. |
-| 5xx | Ambiguous | May have been emitted after creation upstream. |
-| Other 2xx (202, 204, …) | Ambiguous | Not a defined outcome; 202 means "queued, not necessarily stored". |
-| Timeout / unreadable / contentless body | Ambiguous | The reply says nothing reliable. |
+| 200, 201 | Resolved | Created, or an idempotent replay. |
+| Validation rejection (400) | Non-creation | Judged before storing. |
+| 409 | Key in use | Proof it *was* used; original ID reported. |
+| 408, 425 | Ambiguous | A proxy can emit these post-storage. |
+| 5xx | Ambiguous | May follow creation upstream. |
+| Other 2xx (202, 204) | Ambiguous | 202 is "queued, not stored". |
+| Timeout / unreadable / contentless | Ambiguous | Says nothing reliable. |
 
 A 200 or 201 must also carry `id`, `status`, and `total_formatted` before
-success is announced or the session's order ID is replaced.
+success is announced. Limits: a validation rejection is **inferred, not
+authenticated**, since a proxy's own 403 is indistinguishable on the wire
+from the service judging the contents; the key is **in memory**, so
+restarting mid-outcome loses it and a later submission could duplicate;
+and `status` **resolves nothing**, reporting ID, status and total but
+never contents, so it cannot confirm *which* contents an uncertain
+`PATCH` stored — the builder says so and prints the `GET /orders/{id}`
+that does show them.
 
-The honest limits:
-
-- **"Validation rejection" is inferred, not authenticated.** 408, 425,
-  and 409 are singled out by status code, and everything else in `[400,
-  500)` is *treated* as the service's own judgement on the contents. A
-  4xx an intermediary synthesizes for its own reasons — a proxy's 403 or
-  404 — is indistinguishable on the wire from that judgement, so the
-  builder would release the key for it. Narrowing this further needs a
-  signal the service controls that a proxy cannot forge, which this
-  exercise does not build.
-- **The key lives in memory**, so restarting the builder before an
-  outcome is known loses it, and a later submission could then duplicate
-  an order the service had already accepted.
-- **No eventual delivery is promised** across a permanent network
-  failure — only that retrying against the running service cannot create
-  a second order.
-- **`status` does not resolve anything.** `status <order-id>` looks up an
-  order you already know the ID of; it deliberately does not adopt that
-  ID as the session's order or resolve a pending submission. It also
-  reports only the ID, lifecycle status, and charged total — never items,
-  toppings, tip, or promo — so it cannot confirm *which* contents the
-  service holds after an uncertain `PATCH`: two different orders can
-  share a total. The builder says so in that situation and prints the
-  `GET /orders/{id}` call that does show the stored contents. The surest
-  recovery remains resending the same update, which is a wholesale
-  replacement and therefore idempotent.
-
-*Cancel at the moment the kitchen starts.* Both operations serialize on
-the store mutex, and each validates the status inside the lock. One of
-them runs first and succeeds; the other observes the new status —
-`Started` blocks the cancel, `Cancelled` blocks the advance — and fails
-with a 409 and a message naming the current status. Guarantee: exactly
-one winner, never an order that is both cancelled and started. A test
-releases a cancel and an advance simultaneously against the same order
-100 times and asserts exactly one success and a consistent final state
-every time (and the store is exercised under `go test -race`).
+*Cancel as the kitchen starts.* Both serialize on the mutex and validate
+status inside the lock. One wins; the other sees the new status —
+`Started` blocks the cancel, `Cancelled` blocks the advance — and gets a
+409 naming it. Guarantee: exactly one winner, never an order both
+cancelled and started, raced 100 times under `-race`.
 
 ### What was cut, and what comes next
 
-Deliberately cut to stay in the timebox: persistence (in-memory store
-only); a real kitchen/delivery integration (advancement is an endpoint
-or a timer); authentication; partial updates; concurrent editing aids
-(order versioning/ETags — updates are last-writer-wins, acceptable for a
-single anonymous customer per order); a menu administration UI (the menu
-is a data table in code). Proportionate for a 3-hour exercise; each is a
-documented assumption rather than a hidden gap.
+Cut to stay in the timebox, each a documented assumption rather than a
+hidden gap: persistence; kitchen/delivery integration (advancement is an
+endpoint); authentication; partial updates; order versioning (updates are
+last-writer-wins); a menu admin UI (the menu is a data table). Next, in
+order:
 
-Next, in order:
-
-1. **Persist orders and idempotency keys.** This is the one cut with a
-   correctness consequence rather than only a convenience cost: because
-   the key→order record lives in memory, a service restart forgets it, so
-   a retry after a restart is no longer protected and can create a second
-   order. The store's operations map onto a single SQL table plus a
-   uniqueness constraint on the key, and the lock discipline becomes a
-   transaction — but note this is a *substitution*, not a drop-in: `Store`
-   is a concrete type today, so persisting it means either introducing an
-   interface or changing that type, and every method would start
-   returning errors the handlers must map.
-2. **Unguessable order IDs and auth on the restaurant-side endpoints.**
-   IDs are currently sequential (`ord-0001`), so anyone can enumerate and
-   cancel other customers' orders; `/advance` is likewise unauthenticated.
-   Acceptable only because the exercise excludes auth.
-3. **Order versioning (ETag / `If-Match`)** so an update based on stale
-   state gets a 409 instead of silently overwriting. Today updates are
-   last-writer-wins, which is fine for one customer per order and wrong
-   the moment two devices share one.
-4. **Structured request logging and a metrics hook** (order counts by
-   status, rejection reasons) — the operability a real service is paged
-   on, and what would reveal whether the ambiguous-outcome paths above
-   ever actually fire in production.
+1. **Persist orders and idempotency keys** — the one cut with a
+   correctness consequence, not just a convenience cost: a restart
+   forgets the key→order record, so a retry afterwards can duplicate. It
+   maps onto a SQL table plus a uniqueness constraint, but is a
+   *substitution*, not a drop-in: `Store` is concrete, and every method
+   would start returning errors.
+2. **Unguessable IDs and auth on restaurant-side endpoints**, as IDs are
+   sequential (`ord-0001`) and `/advance` is unauthenticated.
+3. **Order versioning (ETag / `If-Match`)** so a stale update gets a 409
+   instead of silently overwriting.
+4. **Structured logging and metrics**, which would reveal whether the
+   ambiguous paths above ever fire in production.
 
 ## Testing
 
@@ -658,89 +552,83 @@ the restart-duplication limit is stated in the retry section above rather
 than tested). The fault injection models damaged *responses*; it does not
 model partially-written requests or a service that crashes mid-write.
 
+### Why these invariants
+
+Each group of tests is aimed at a specific way a pizza order can go wrong
+for a real customer, not at a coverage number:
+
+- **Pricing tests prevent incorrect charges.** Money is the output the
+  customer is held to, so the hand-computed orders, the round-half-up
+  edges, the SAVE5 boundary, and the overflow guards exist to stop a
+  wrong total — by a cent or by a wrap — from ever being quoted or
+  stored.
+- **Lifecycle and concurrency tests prevent illegal state changes.** The
+  per-status rejection tests and the racing cancel/advance rounds keep an
+  order from being edited after the kitchen has started it or from
+  landing in a status the state machine does not permit, even when two
+  requests arrive at once.
+- **Retry tests prevent duplicate orders.** The idempotency-key, replay,
+  and fault-injected recovery tests all protect one guarantee: a customer
+  who retries an ambiguous submission is charged for one pizza order, not
+  two.
+- **Validation and copy-isolation tests protect stored data.** Strict
+  decoding and atomic validation failure keep a malformed or partially
+  valid request from mutating a stored order, and the deep-copy
+  assertions keep a caller's later edits to its own slices from silently
+  rewriting what the store holds.
+
+The omitted areas were deferred because they cost the most time while
+protecting the least within a 3-hour timebox. The interactive read loop is
+a thin `bufio.Scanner` wrapper over command handlers that are already
+tested directly, so covering it would mostly test the standard library.
+Load and performance work needs a target to be meaningful, and the
+exercise sets none; the store is a mutex-guarded map whose contention
+behavior would say little about a persisted implementation. Restart
+behavior is not tested because there is nothing durable to restart into —
+storage is in-memory by documented assumption, and the resulting
+retry-after-restart duplication is stated as a known limit in the retry
+section and listed first under future work, which is the honest treatment
+until persistence exists. Each omission is therefore a stated boundary
+rather than an untested assumption.
+
 ## AI usage note
 
-**Tools used.** Claude (Anthropic) and GitHub Copilot were both used on
-this repository: Claude produced the first working implementation —
-structure, pricing/service/builder code, and tests — from the exercise
-specification, and both were used across the subsequent review rounds that
-produced the audit in `TODO.md` and the fixes recorded there. The commit
-history shows those rounds as separate commits rather than one drop.
+Claude (Anthropic) wrote the first working implementation — structure,
+pricing/service/builder code, and tests — from the exercise spec, and
+Claude and GitHub Copilot were both used in the later review rounds that
+produced the fixes; the commit history shows those as separate rounds.
 
-The design decisions in the Assumptions section (integer-cents money, a
-shared pricing package as the single source of truth, idempotency keys,
-the locked state machine, the tip-base and order-of-operations choices)
-were specified up front and then checked against the AI's output.
+- **One example of AI output that was rejected and fixed.** The API
+  client discarded JSON decode errors (assigning them to `_`), so an
+  empty or truncated 201 was announced as success, printing
+  `Order  submitted. Status: . Total charged: .`. Fixing it took two
+  passes — `apiClient.call` now returns body-read and decode errors
+  wrapped with `%w` (so a body-read timeout still triggers the retry
+  branch), and because `{}` and `null` still decoded cleanly,
+  `orderResponse.validateOrder` now requires `id`, `status`, and
+  `total_formatted` before any success is printed.
 
-An important caveat about this section, stated plainly because it affects
-how the rest of it should be read: the specification audits and the
-fix rounds were themselves AI-assisted. Where a finding below is
-described as "reproduced" or "verified", that means it was demonstrated
-with a running program and is now pinned by a test anyone can re-run —
-not that it was found by unaided human inspection. The distinction
-matters, so it is drawn rather than blurred.
-
-- **One example of AI output that was rejected and fixed.** The initial
-  API client discarded JSON decode errors (the `json.Decode` error was
-  assigned to `_`), so an empty or truncated HTTP 201 response was
-  reported as a successful submission and printed
-  `Order  submitted. Status: . Total charged: .`. Two rounds of fixes
-  were needed, because the first round was incomplete:
-  1. `apiClient.call` now returns body-read and decode errors, wrapping
-     them with `%w` so a body-read timeout is still classified as a
-     timeout and the retry branch fires.
-  2. That alone was not enough: a well-formed but contentless reply
-     (`{}` or `null`) still decoded cleanly and was announced as success.
-     `orderResponse.validateOrder` now requires `id`, `status`, and
-     `total_formatted` before any success message is printed or the
-     session's order ID is replaced.
-
-  A related correction in the same area, which took three passes to get
-  right and is the clearest example of AI output that looked finished but
-  was not. The original code assumed a non-timeout error proved the
-  request never reached the service, and discarded the idempotency key —
-  so a retry created a duplicate. The first fix narrowed that to "release
-  the key on any 4xx", which is still wrong: a 408 or 425 reports that the
-  request failed to *arrive usably* and can be emitted by a proxy after
-  the origin already stored the order. The rule is now that the key is
-  released only for a response that reads as the service's own
-  *validation* rejection of the contents, with 408/425, 409, 5xx, and any
-  unexpected 2xx all treated as unresolved. That rule is still an
-  inference from the status code rather than an authenticated signal —
-  the residual gap is stated in the retry section above — but it no
-  longer releases the key for the delivery failures that actually
-  produced the duplicate. Each wrong version passed the tests that
-  existed when it was written, which is the lesson.
-
-- **One invariant checked by demonstration rather than by trusting the
-  code.** The invariant is requirement 5's: *an unreliable connection must
-  never leave the restaurant holding two orders.* Reading the code was not
-  enough to settle it — the code looked correct in all three of the wrong
-  versions above. So it is checked by construction instead, in
-  `cmd/builder/recovery_test.go`: the real builder talks to the real
-  service through a proxy that always delivers the request and then
-  damages only the reply. For each of six failure modes (lost body,
-  truncated JSON, 502, a 408 issued after the order was stored, a
-  contentless 200, and a 202) the test retries and then asserts directly
-  against the service's own store that **exactly one** order exists and
-  that the ID the customer holds is that order.
+- **One invariant checked by myself rather than by trusting the AI.** The
+  invariant is requirement 5's: *an unreliable connection must never
+  leave the restaurant holding two orders.* Reading the code was not
+  enough to settle it — the code looked correct. So it is checked by
+  construction instead, in `cmd/builder/recovery_test.go`: the real
+  builder talks to the real service through a proxy that always delivers
+  the request and then damages only the reply. For each of six failure
+  modes (lost body, truncated JSON, 502, a 408 issued after the order was
+  stored, a contentless 200, and a 202) the test retries and then asserts
+  directly against the service's own store that **exactly one** order
+  exists and that the ID the customer holds is that order.
 
   That construction is what makes the claim falsifiable: reverting any of
-  the fixes makes `store.Count()` return 2 and the test fail by naming the
-  duplicate. The same method found the other defects — the false-success
-  decoding, the dollar-conversion wrap (`tip amount 184467440737095517`
-  displaying `$0.84`), the replay-comparison inversion after a `PATCH`, and
-  the `float64` round-trip that turned `quantity:1.00000000000000001` into
-  quantity 1 — each of which the test suite of the time accepted. Every
-  one is now pinned by a regression test, so all the claims in this
-  section can be re-checked with `go test -race ./...`.
-
-> **Reviewer's note.** Treat this section as a description of work that is
-> inspectable in the repository — the commits, the fixes, and the tests
-> named above — rather than as a claim about unaided human effort. The
-> audits and fixes were AI-assisted, which is precisely why each finding
-> is tied to a test that fails when the fix is reverted: the evidence
-> stands on being reproducible, not on who or what noticed it first.
+  the fixes makes `store.Count()` return 2 and the test fail by naming
+  the duplicate. The same method found the other defects — the
+  false-success decoding, the dollar-conversion wrap (`tip amount
+  184467440737095517` displaying `$0.84`), the replay-comparison
+  inversion after a `PATCH`, and the `float64` round-trip that turned
+  `quantity:1.00000000000000001` into quantity 1 — each of which the test
+  suite of the time accepted. Every one is now pinned by a regression
+  test.
 
 ## Repository layout
 
