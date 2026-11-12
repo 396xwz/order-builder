@@ -168,6 +168,177 @@ func TestLifecycleEndsAreTerminal(t *testing.T) {
 	}
 }
 
+func TestUpdateCancelRejectedInAllTerminalStates(t *testing.T) {
+	states := []struct {
+		name    string
+		advance int // how many advances to reach this state
+	}{
+		{"Started", 1},
+		{"Ready for Pickup", 2},
+		{"Delivered", 3},
+	}
+	for _, st := range states {
+		t.Run(st.name, func(t *testing.T) {
+			s := New()
+			o := mustCreate(t, s, smallOrder(), "")
+			for i := 0; i < st.advance; i++ {
+				if _, err := s.Advance(o.ID); err != nil {
+					t.Fatalf("advance step %d: %v", i+1, err)
+				}
+			}
+			// Update must fail.
+			if _, err := s.Update(o.ID, smallOrder()); !errors.Is(err, ErrStateConflict) {
+				t.Errorf("Update in %s: got %v, want ErrStateConflict", st.name, err)
+			}
+			// Cancel must fail.
+			if _, err := s.Cancel(o.ID); !errors.Is(err, ErrStateConflict) {
+				t.Errorf("Cancel in %s: got %v, want ErrStateConflict", st.name, err)
+			}
+		})
+	}
+	// Cancelled order: Update and Cancel must fail.
+	t.Run("Cancelled", func(t *testing.T) {
+		s := New()
+		o := mustCreate(t, s, smallOrder(), "")
+		if _, err := s.Cancel(o.ID); err != nil {
+			t.Fatalf("Cancel: %v", err)
+		}
+		if _, err := s.Update(o.ID, smallOrder()); !errors.Is(err, ErrStateConflict) {
+			t.Errorf("Update after Cancel: got %v, want ErrStateConflict", err)
+		}
+		if _, err := s.Cancel(o.ID); !errors.Is(err, ErrStateConflict) {
+			t.Errorf("second Cancel: got %v, want ErrStateConflict", err)
+		}
+	})
+}
+
+func TestAtomicValidationFailureLeavesStateUnchanged(t *testing.T) {
+	s := New()
+	in := order.Input{Items: []pricing.LineItem{{Size: "Small", Quantity: 1}}, Tip: pricing.Tip{Mode: pricing.TipAmount, Amount: 100}}
+	o := mustCreate(t, s, in, "")
+	original := o.Totals.Total
+
+	// Try an invalid update (unknown size).
+	bad := order.Input{Items: []pricing.LineItem{{Size: "Huge", Quantity: 1}}}
+	_, err := s.Update(o.ID, bad)
+	if err == nil {
+		t.Fatal("expected error for invalid update")
+	}
+
+	// Re-read and verify unchanged.
+	got, ok := s.Get(o.ID)
+	if !ok {
+		t.Fatal("order should still exist")
+	}
+	if got.Totals.Total != original {
+		t.Errorf("total changed from %s to %s after failed update", original, got.Totals.Total)
+	}
+	if len(got.Items) != 1 || got.Items[0].Size != "Small" {
+		t.Errorf("items changed after failed update: %+v", got.Items)
+	}
+}
+
+func TestStoreOwnershipPreventsExternalMutation(t *testing.T) {
+	s := New()
+	o := mustCreate(t, s, smallOrder(), "")
+	// Mutate the returned copy.
+	o.Items[0].Quantity = 999
+	o.Tip.Amount = 99999
+
+	// The stored order must be unchanged.
+	got, ok := s.Get(o.ID)
+	if !ok {
+		t.Fatal("order should exist")
+	}
+	if got.Items[0].Quantity == 999 {
+		t.Error("stored quantity changed after external mutation")
+	}
+	if got.Tip.Amount == 99999 {
+		t.Error("stored tip changed after external mutation")
+	}
+}
+
+func TestConcurrentIdempotency(t *testing.T) {
+	const goroutines = 10
+	s := New()
+	start := make(chan struct{})
+	results := make(chan string, goroutines)
+
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			<-start
+			o, _, err := s.Create(smallOrder(), "same-key")
+			if err != nil {
+				results <- ""
+				return
+			}
+			results <- o.ID
+		}()
+	}
+	close(start)
+
+	ids := map[string]int{}
+	for i := 0; i < goroutines; i++ {
+		id := <-results
+		if id != "" {
+			ids[id]++
+		}
+	}
+	if len(ids) != 1 {
+		t.Errorf("got %d distinct order IDs, want exactly 1: %v", len(ids), ids)
+	}
+	if s.Count() != 1 {
+		t.Errorf("store holds %d orders, want 1", s.Count())
+	}
+}
+
+func TestAdvanceAll(t *testing.T) {
+	s := New()
+
+	// Empty store.
+	if n := s.AdvanceAll(); n != 0 {
+		t.Errorf("AdvanceAll on empty store returned %d, want 0", n)
+	}
+
+	// Three Not Started orders.
+	mustCreate(t, s, smallOrder(), "")
+	mustCreate(t, s, smallOrder(), "")
+	mustCreate(t, s, smallOrder(), "")
+
+	if n := s.AdvanceAll(); n != 3 {
+		t.Errorf("AdvanceAll advanced %d, want 3", n)
+	}
+	if n := s.AdvanceAll(); n != 3 {
+		t.Errorf("AdvanceAll second round advanced %d, want 3", n)
+	}
+	if n := s.AdvanceAll(); n != 3 {
+		t.Errorf("AdvanceAll third round advanced %d, want 3", n)
+	}
+	// Fourth round: all are Delivered (terminal), should advance 0.
+	if n := s.AdvanceAll(); n != 0 {
+		t.Errorf("AdvanceAll after all delivered: %d, want 0", n)
+	}
+}
+
+func TestCancelDoesNotAffectOtherOrders(t *testing.T) {
+	s := New()
+	o1 := mustCreate(t, s, smallOrder(), "")
+	o2 := mustCreate(t, s, smallOrder(), "")
+
+	if _, err := s.Cancel(o1.ID); err != nil {
+		t.Fatalf("Cancel: %v", err)
+	}
+
+	// o2 should be unaffected.
+	got, ok := s.Get(o2.ID)
+	if !ok {
+		t.Fatal("o2 should exist")
+	}
+	if got.Status != order.StatusNotStarted {
+		t.Errorf("o2 status = %q, want %q", got.Status, order.StatusNotStarted)
+	}
+}
+
 func TestNotFound(t *testing.T) {
 	s := New()
 	if _, ok := s.Get("ord-9999"); ok {

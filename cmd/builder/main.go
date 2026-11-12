@@ -121,10 +121,22 @@ func (s *session) dispatch(line string) bool {
 	case "submit":
 		s.submit()
 	case "status":
+		if len(args) > 1 {
+			fmt.Fprintln(s.out, "Usage: status [<order-id>]")
+			break
+		}
 		s.status(args)
 	case "update":
+		if len(args) > 0 {
+			fmt.Fprintln(s.out, "Usage: update (no arguments)")
+			break
+		}
 		s.update()
 	case "cancel":
+		if len(args) > 1 {
+			fmt.Fprintln(s.out, "Usage: cancel [<order-id>]")
+			break
+		}
 		s.cancel(args)
 	default:
 		fmt.Fprintf(s.out, "Unknown command %q — type 'help' for the list.\n", fields[0])
@@ -445,6 +457,9 @@ func parseMoney(s string) (pricing.Cents, error) {
 			return 0, fmt.Errorf("%q has more than two decimal places", s)
 		}
 		frac = (frac + "00")[:2]
+		if strings.TrimLeft(frac, "0123456789") != "" {
+			return 0, fmt.Errorf("%q has invalid digits in the fractional part", s)
+		}
 		cents, err = strconv.ParseInt(frac, 10, 64)
 		if err != nil {
 			return 0, fmt.Errorf("%q is not a valid amount", s)

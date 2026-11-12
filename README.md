@@ -35,8 +35,9 @@ go run ./cmd/builder                 # type 'help' at the prompt
 go test ./...
 ```
 
-Building binaries instead works too: `go build ./...` produces
-`orderservice` and `builder`.
+Building binaries: `go build -o orderservice ./cmd/orderservice` and
+`go build -o builder ./cmd/builder` produce the two executables.
+(`go build ./...` compiles everything but does not write named binaries.)
 
 ### A taste of the builder
 
@@ -110,8 +111,12 @@ Trying to cancel after the kitchen has started the order (409):
 
 The request body for `POST /orders` and `PATCH /orders/{id}` is the
 order's contents only — items, tip, promo code. There is deliberately no
-totals field: the service computes totals itself and ignores nothing
-because there is nothing to ignore.
+totals field: the service computes totals itself and rejects unknown
+top-level fields as well as trailing content after the JSON value. The
+`Tip` object requires a consistent `mode` field: when mode is `""` (no
+tip), `amount_cents` and `percent` must be zero; when mode is
+`"amount"`, `percent` must be zero; when mode is `"percent"`,
+`amount_cents` must be zero.
 
 ## Assumptions
 
@@ -134,9 +139,13 @@ where it lives in the code:
 4. **"Over $20" is strict.** SAVE5 requires a pre-tax subtotal *greater
    than* $20.00; exactly $20.00 does not qualify. Tested at the boundary.
 5. **An unqualified promo is rejected, not ignored.** Applying SAVE5 to a
-   $20-or-less order (at set time, submit, or update) is an error with a
-   clear message. The customer is never silently denied a discount they
-   think they have — nor silently charged without one.
+   $20-or-less order (at submit, update, or at set time when the order
+   already has items) is an error with a clear message. Exception: setting
+   a promo on an empty order always succeeds — it cannot be qualified
+   until items are added. Adding items later that should un-qualify the
+   promo is caught at the next submit or update. The customer is never
+   silently denied a discount they think they have — nor silently charged
+   without one.
 6. **Promo conflicts are errors.** SAVE5 and ILOVEPIZZA cannot combine;
    applying one while the other is set fails with a message telling the
    customer to clear the current promo first. Nothing stacks, nothing is
@@ -183,9 +192,13 @@ on every edit with no network round-trips. The service recomputes the
 total on every submission and update and never accepts a client-supplied
 total (the request format has no totals field at all). Requirement 2 —
 "the total the customer sees must match the total the restaurant
-charges" — is therefore guaranteed by construction rather than by keeping
-two implementations in sync, and a test submits an order over HTTP and
-asserts the service's totals equal the pricing package's, cent for cent.
+charges" — is therefore guaranteed for the same input on both sides:
+shared pricing prevents calculation drift, but the guarantee also
+depends on the client sending the correct contents (verifiable by the
+server's strict JSON decoding; see F01/F07) and the response body being
+correctly received (verifiable by the client's response decode error
+handling; see F01). An HTTP-level test asserts the service's totals
+equal the pricing package's, cent for cent, for a round-tripped order.
 
 ### Extensibility: menu and promos as data
 
@@ -224,8 +237,14 @@ order may or may not have arrived — the builder retries once with the
 **same** key and tells the customer it is doing so. The service records
 key → order ID on first submission; the retry finds the key and returns
 the original order (HTTP 200 instead of 201) instead of creating a
-duplicate. Guarantee: at most one order per key, and the customer ends up
-holding the right ID either way.
+duplicate. Guarantee: at most one order created per key within the
+running service. If **both** attempts fail, the outcome is unknown: the
+builder blocks local edits and surfaces the unresolved state so the
+customer can retry. The idempotency key is lost on builder restart, so a
+restart before a successful submission could create a duplicate after an
+undetected first success. Waiting and retrying later is safe for the
+customer: because the key is reused, retries against the running service
+return the original order.
 
 *Cancel at the moment the kitchen starts.* Both operations serialize on
 the store mutex, and each validates the status inside the lock. One of
@@ -256,27 +275,72 @@ kind of operability a real service would be paged on.
 
 ## Testing
 
-Run with `go test ./...` (the store and its race test are also clean
-under `go test -race ./...`).
+Run with `go test ./...` or `go test -race ./...`.
 
-Invariants chosen, and why:
+Packages tested and what they cover:
 
-- **Pricing arithmetic is exact.** Every size × topping-category price;
-  three full orders computed by hand from the spec, including rounding
-  cases (a 92.82¢ tax, a 201.2¢ discount). Pricing is the heart of the
-  exercise, so it gets the deepest coverage.
-- **The SAVE5 boundary.** Exactly $20.00 does not qualify; $20.01 does.
-  "Over $20" is precisely the kind of phrase implementations get wrong.
-- **Promo mutual exclusion** (including symmetry of the conflict data, so
-  exclusion cannot depend on which code was applied first).
-- **Builder total == charged total**, asserted over HTTP.
-- **Idempotent resubmission** returns the original order and stores
-  exactly one — at the store level and over HTTP.
-- **Illegal lifecycle transitions are rejected**: update/cancel after
-  Started, advancing a Delivered or Cancelled order.
-- **The cancel-vs-advance race** yields exactly one winner (100 rounds).
-- **Invalid input is rejected with errors**: unknown size/topping/promo,
-  zero quantity, duplicate topping, out-of-range tip.
+### `internal/pricing` — arithmetic, menu, and validation
+
+- Every size × topping-category price computed by hand, including
+  rounding (6.5% of $14.28 = 92.82¢ → 93¢, 10% of $20.12 = 201.2¢ →
+  201¢). Round-half-up is tested edge-to-edge.
+- Three full orders computed by hand from the spec.
+- The SAVE5 boundary: exactly $20.00 does not qualify; $20.01 does.
+- Promo mutual exclusion, including symmetry of conflict data.
+- Invalid input: unknown size/topping/promo, zero quantity, duplicate
+  topping, out-of-range tip, negative tip amount.
+- Overflow: `safeAdd`, `safeMul`, `safePercentOf` reject arithmetic
+  overflow; `LineTotal` and `Price` bound quantities and subtotals.
+- `Cents.String` handles the `MinInt64` negation edge case.
+
+### `internal/order` — model and lifecycle
+
+- Every `Status.Next` outcome and terminal-state detection.
+- Deep-copy isolation.
+
+### `internal/store` — lifecycle enforcement, idempotency, concurrency
+
+- Update/cancel rejection for every non-`Not Started` status (Started,
+  Ready for Pickup, Delivered, Cancelled).
+- Atomic validation failure: an invalid update leaves the order's items,
+  tip, totals, and timestamps unchanged.
+- Store ownership: mutating a returned copy cannot mutate the stored
+  order's line items or toppings.
+- Idempotent create (same key → original order, no duplicate), including
+  concurrent idempotency (10 goroutines with one key still produce one
+  order and one original ID).
+- Same-key/different-body rejection with the original order ID in the
+  error message.
+- Create without key always creates a new order.
+- `AdvanceAll` advances each eligible order exactly one step, skips
+  terminal states, and returns the right count (including an empty
+  store).
+- The cancel-vs-advance race yields exactly one winner (100 rounds).
+
+### `internal/server` — HTTP handler invariants
+
+- Submitted totals agree with the shared pricing package for the same
+  input, cent for cent.
+- Idempotent replay over HTTP returns 200 instead of 201.
+- Lifecycle conflicts return 409 with a readable message.
+- Bad promos and unqualified promos return 400.
+- Trailing content after JSON is rejected with 400.
+- Unknown top-level fields are rejected with 400.
+- Tip mode/field contradictions are rejected with 400.
+- Rejected requests leave the store unchanged.
+
+### `cmd/builder` — CLI parsing and session logic
+
+- `parseMoney` accepts valid dollar amounts and rejects invalid forms
+  (bad signs, too many decimals, garbage).
+- `parseToppings` normalizes names, handles separators and whitespace.
+- `Describe` formats orders correctly (toppings, plain, totals).
+- `showTotals` shows subtotal, discount(if any), tax, tip, and total.
+- Local editing commands (add, remove, setqty, settoppings, tip, promo)
+  update state and show the new totals.
+- Pending-submission state: `hasPending` detects unresolved timeouts;
+  editing commands are blocked while pending.
+- Dispatch routes commands correctly.
 
 Not covered: the CLI's interactive loop itself (its pricing and API paths
 are covered through the packages it calls; the loop was verified by

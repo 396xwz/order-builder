@@ -29,7 +29,7 @@ func TestParseMoney(t *testing.T) {
 			}
 		})
 	}
-	for _, input := range []string{"", " ", "$", "-1", "$-0.01", "abc", "1.234", "1.", ".50", "1.2.3", "3.x"} {
+	for _, input := range []string{"", " ", "$", "-1", "$-0.01", "abc", "1.234", "1.", ".50", "1.2.3", "3.x", "1.-1", "1.+1"} {
 		t.Run("invalid/"+input, func(t *testing.T) {
 			if got, err := parseMoney(input); err == nil {
 				t.Errorf("parseMoney(%q) = %d without an error", input, got)

@@ -10,6 +10,7 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 
 	"pizzabuilder/internal/order"
@@ -109,13 +110,76 @@ func (h *handler) advanceOrder(w http.ResponseWriter, r *http.Request) {
 // decodeInput reads and validates the request body's shape. Semantic
 // validation (sizes, toppings, promos, totals) happens in the store via
 // the pricing package.
+//
+// The server enforces a strict JSON shape: no unknown top-level fields,
+// no trailing content after the JSON value, and a 1 MiB body limit.
 func decodeInput(w http.ResponseWriter, r *http.Request) (order.Input, bool) {
-	var in order.Input
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
-	if err := dec.Decode(&in); err != nil {
+	br := http.MaxBytesReader(w, r.Body, 1<<20)
+	dec := json.NewDecoder(br)
+
+	// First decode into a generic map to check for unknown top-level fields.
+	var raw map[string]any
+	if err := dec.Decode(&raw); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
-		return in, false
+		return order.Input{}, false
 	}
+	knownFields := map[string]bool{"items": true, "tip": true, "promo_code": true}
+	for key := range raw {
+		if !knownFields[key] {
+			writeError(w, http.StatusBadRequest, "unknown field "+key)
+			return order.Input{}, false
+		}
+	}
+
+	// Re-marshal into the typed struct to reject mismatched types.
+	b, err := json.Marshal(raw)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return order.Input{}, false
+	}
+	var in order.Input
+	if err := json.Unmarshal(b, &in); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return order.Input{}, false
+	}
+
+	// Check for trailing content after the JSON value.
+	var trailing any
+	if err := dec.Decode(&trailing); err == nil {
+		writeError(w, http.StatusBadRequest, "unexpected content after request body")
+		return order.Input{}, false
+	} else if !errors.Is(err, io.EOF) {
+		// Non-EOF error means non-whitespace trailing bytes.
+		writeError(w, http.StatusBadRequest, "unexpected content after request body")
+		return order.Input{}, false
+	}
+
+	// Validate tip: if mode is empty/none, amount and percent must be zero.
+	switch in.Tip.Mode {
+	case pricing.TipNone:
+		if in.Tip.Amount != 0 {
+			writeError(w, http.StatusBadRequest, "tip mode is none but amount_cents is set")
+			return order.Input{}, false
+		}
+		if in.Tip.Percent != 0 {
+			writeError(w, http.StatusBadRequest, "tip mode is none but percent is set")
+			return order.Input{}, false
+		}
+	case pricing.TipAmount:
+		if in.Tip.Percent != 0 {
+			writeError(w, http.StatusBadRequest, "tip mode is amount but percent is also set")
+			return order.Input{}, false
+		}
+	case pricing.TipPercent:
+		if in.Tip.Amount != 0 {
+			writeError(w, http.StatusBadRequest, "tip mode is percent but amount_cents is also set")
+			return order.Input{}, false
+		}
+	default:
+		writeError(w, http.StatusBadRequest, "unknown tip mode")
+		return order.Input{}, false
+	}
+
 	return in, true
 }
 

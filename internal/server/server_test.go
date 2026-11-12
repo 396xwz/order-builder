@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"pizzabuilder/internal/order"
@@ -148,5 +150,90 @@ func TestBadRequests(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("GET missing order status = %d, want 404", resp.StatusCode)
+	}
+}
+
+// postRaw sends a raw JSON body and returns the status code and response text.
+func postRaw(t *testing.T, url, body string) (int, string) {
+	t.Helper()
+	req, _ := http.NewRequest(http.MethodPost, url, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST %s: %v", url, err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(b)
+}
+
+func TestTrailingContentRejected(t *testing.T) {
+	srv, st := testServer(t)
+	before := st.Count()
+
+	// Valid input followed by more JSON content.
+	status, body := postRaw(t, srv.URL+"/orders", `{"items":[{"size":"Small","quantity":1}]} garbage`)
+	if status != http.StatusBadRequest {
+		t.Errorf("trailing content status = %d, want 400. body: %s", status, body)
+	}
+	if st.Count() != before {
+		t.Errorf("store changed: %d -> %d", before, st.Count())
+	}
+
+	// Two JSON objects.
+	status, body = postRaw(t, srv.URL+"/orders", `{"items":[{"size":"Small","quantity":1}]}{"a":1}`)
+	if status != http.StatusBadRequest {
+		t.Errorf("two JSON objects status = %d, want 400. body: %s", status, body)
+	}
+	if st.Count() != before {
+		t.Errorf("store changed: %d -> %d", before, st.Count())
+	}
+}
+
+func TestUnknownFieldsRejected(t *testing.T) {
+	srv, st := testServer(t)
+	before := st.Count()
+
+	status, body := postRaw(t, srv.URL+"/orders", `{"items":[{"size":"Small","quantity":1}],"totals":{"subtotal_cents":100}}`)
+	if status != http.StatusBadRequest {
+		t.Errorf("unknown field status = %d, want 400. body: %s", status, body)
+	}
+	if !strings.Contains(body, "unknown field") {
+		t.Errorf("body should mention unknown field, got: %s", body)
+	}
+	if st.Count() != before {
+		t.Errorf("store changed: %d -> %d", before, st.Count())
+	}
+}
+
+func TestTipModeValidation(t *testing.T) {
+	srv, st := testServer(t)
+	before := st.Count()
+
+	// mode=none but amount_cents is set -> 400.
+	status, body := postRaw(t, srv.URL+"/orders", `{"items":[{"size":"Small","quantity":1}],"tip":{"mode":"","amount_cents":300}}`)
+	if status != http.StatusBadRequest {
+		t.Errorf("mode=none with amount status = %d, want 400. body: %s", status, body)
+	}
+	if !strings.Contains(body, "tip") {
+		t.Errorf("body should mention tip, got: %s", body)
+	}
+	if st.Count() != before {
+		t.Errorf("store changed: %d -> %d", before, st.Count())
+	}
+
+	// mode=amount with percent set -> 400.
+	status, body = postRaw(t, srv.URL+"/orders", `{"items":[{"size":"Small","quantity":1}],"tip":{"mode":"amount","amount_cents":300,"percent":10}}`)
+	if status != http.StatusBadRequest {
+		t.Errorf("mode=amount with percent status = %d, want 400. body: %s", status, body)
+	}
+	if st.Count() != before {
+		t.Errorf("store changed: %d -> %d", before, st.Count())
+	}
+
+	// Legitimate tip should still work.
+	status, body = postRaw(t, srv.URL+"/orders", `{"items":[{"size":"Small","quantity":1}],"tip":{"mode":"amount","amount_cents":300}}`)
+	if status != http.StatusCreated {
+		t.Errorf("valid tip status = %d, want 201. body: %s", status, body)
 	}
 }
