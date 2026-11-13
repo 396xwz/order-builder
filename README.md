@@ -354,7 +354,12 @@ order:
 
 ## Testing
 
-Run with `go test ./...` or `go test -race ./...`.
+Run with `go test ./...` or `go test -race ./...`. The manual end-to-end
+pass — a curl battery against the live service, the cancel-vs-advance
+race, and fault-injected lost-response recovery — lives in
+[TESTPLAN.md](TESTPLAN.md), with expected values hand-computed from the
+spec and the results of the executed run recorded in its Results table
+(all recorded cases passed).
 
 Packages tested and what they cover:
 
@@ -593,7 +598,7 @@ rather than an untested assumption.
 
 ## AI usage note
 
-Claude (Anthropic) wrote the first working implementation — structure,
+Muse(Meta) wrote the first working implementation — structure,
 pricing/service/builder code, and tests — from the exercise spec, and
 Claude and GitHub Copilot were both used in the later review rounds that
 produced the fixes; the commit history shows those as separate rounds.
